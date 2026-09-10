@@ -24,7 +24,11 @@ interleaved or half-counted receipt.
 Business order numbers are canonicalised (surrounding whitespace stripped)
 before every read and write, so visually identical numbers -- ``"PO-1"``
 versus ``"  PO-1  "`` -- always address the same receipt and can never
-coexist as two separate orders.
+coexist as two separate orders. Rows written *before* this canonicalisation
+may still carry the padded spelling in the database; they are resolved to
+the same canonical number on every access (an exactly-canonical row wins
+when both spellings exist), so the original receipt stays valid and a
+repeated number is still rejected as a duplicate.
 """
 from __future__ import annotations
 
@@ -188,10 +192,37 @@ def _canonical_order_no(order_no: str) -> str:
     return order_no.strip()
 
 
+def _resolve_stored_order_no(
+    connection: sqlite3.Connection | sqlite3.Cursor, canonical: str
+) -> str | None:
+    """Return the stored ``receipts`` key for a canonical order number.
+
+    Rows written since canonicalisation match exactly. Rows created
+    *before* it may still store the same number with surrounding
+    whitespace; the oldest such row is returned, so the original receipt
+    stays addressable and counts as a duplicate -- its data is never
+    rewritten. An exactly-canonical row always wins over a padded legacy
+    spelling when both exist.
+    """
+    row = connection.execute(
+        "SELECT order_no FROM receipts WHERE order_no = ?", (canonical,)
+    ).fetchone()
+    if row is not None:
+        return row["order_no"]
+    for legacy in connection.execute(
+        "SELECT order_no FROM receipts ORDER BY rowid"
+    ):
+        stored = legacy["order_no"]
+        if stored.strip() == canonical:
+            return stored
+    return None
+
+
 def create_receipt(order_no: str, lines: list[tuple[str, int]]) -> None:
     """Insert one receipt order and its planned lines in a single transaction.
 
-    Raises :class:`OrderAlreadyExists` on a duplicate business order number.
+    Raises :class:`OrderAlreadyExists` on a duplicate business order number
+    (including a padded spelling stored before canonicalisation).
     Any other SQLite failure becomes :class:`StorageUnavailable` and leaves
     no partial order behind.
     """
@@ -199,6 +230,11 @@ def create_receipt(order_no: str, lines: list[tuple[str, int]]) -> None:
     with _write_lock:
         try:
             with _transaction() as cursor:
+                if _resolve_stored_order_no(cursor, order_no) is not None:
+                    # A legacy row with a padded spelling is the same
+                    # business number: reject as a duplicate, keep the
+                    # original receipt untouched.
+                    raise OrderAlreadyExists(order_no)
                 cursor.execute(
                     "INSERT INTO receipts(order_no) VALUES (?)", (order_no,)
                 )
@@ -225,16 +261,14 @@ def get_receipt(order_no: str) -> ReceiptState | None:
     with _write_lock:
         try:
             connection = _get_connection()
-            row = connection.execute(
-                "SELECT 1 FROM receipts WHERE order_no = ?", (order_no,)
-            ).fetchone()
-            if row is None:
+            stored = _resolve_stored_order_no(connection, order_no)
+            if stored is None:
                 return None
             item_rows = connection.execute(
                 "SELECT gtin, planned_qty, received_qty FROM receipt_items "
                 "WHERE order_no = ? "
                 "ORDER BY (planned_qty IS NULL), line_order, gtin",
-                (order_no,),
+                (stored,),
             ).fetchall()
         except sqlite3.Error as error:
             raise StorageUnavailable(str(error)) from error
@@ -273,10 +307,8 @@ def record_scan_batch(
     with _write_lock:
         try:
             with _transaction() as cursor:
-                exists = cursor.execute(
-                    "SELECT 1 FROM receipts WHERE order_no = ?", (order_no,)
-                ).fetchone()
-                if exists is None:
+                stored = _resolve_stored_order_no(cursor, order_no)
+                if stored is None:
                     # Raising inside the context manager triggers ROLLBACK.
                     raise OrderNotFound(order_no)
 
@@ -285,7 +317,7 @@ def record_scan_batch(
                     row = cursor.execute(
                         "SELECT planned_qty, received_qty FROM receipt_items "
                         "WHERE order_no = ? AND gtin = ?",
-                        (order_no, gtin),
+                        (stored, gtin),
                     ).fetchone()
 
                     if row is None:
@@ -295,7 +327,7 @@ def record_scan_batch(
                             "INSERT INTO receipt_items"
                             "(order_no, gtin, planned_qty, received_qty, "
                             "line_order) VALUES (?, ?, NULL, 1, 0)",
-                            (order_no, gtin),
+                            (stored, gtin),
                         )
                         planned_qty: int | None = None
                         received = 1
@@ -306,7 +338,7 @@ def record_scan_batch(
                         cursor.execute(
                             "UPDATE receipt_items SET received_qty = ? "
                             "WHERE order_no = ? AND gtin = ?",
-                            (received, order_no, gtin),
+                            (received, stored, gtin),
                         )
                         if planned_qty is None:
                             conclusion = "unplanned"

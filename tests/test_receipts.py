@@ -231,6 +231,89 @@ def test_create_accepts_sqlite_integer_max_quantity(
 
 
 # ---------------------------------------------------------------------------
+# Legacy rows: receipts stored with padded keys before canonicalisation
+# ---------------------------------------------------------------------------
+
+
+def _create_legacy(client: TestClient, order_no: str, lines: list[list]) -> None:
+    """Persist a receipt exactly as pre-canonicalisation code did.
+
+    The old service stored the business number raw, so a database from
+    before the upgrade can hold padded keys like ``"  PO-1  "``.
+    """
+    original = storage._canonical_order_no
+    storage._canonical_order_no = lambda value: value
+    try:
+        assert _create(client, order_no, lines).status_code == 201
+    finally:
+        storage._canonical_order_no = original
+
+
+def test_legacy_padded_receipt_stays_readable(client: TestClient) -> None:
+    _create_legacy(client, "  PO-LEGACY  ", [[GTIN_A, 2]])
+
+    canonical = client.get("/receipts/PO-LEGACY")
+    assert canonical.status_code == 200
+    assert canonical.json()["order_no"] == "PO-LEGACY"
+    assert canonical.json()["items"] == [
+        {"gtin": GTIN_A, "planned_qty": 2, "received_qty": 0}
+    ]
+    # The padded spelling resolves to the same original receipt as well.
+    assert client.get("/receipts/%20%20PO-LEGACY%20%20").status_code == 200
+
+
+def test_legacy_padded_receipt_blocks_recreation_with_409(
+    client: TestClient,
+) -> None:
+    _create_legacy(client, "  PO-LEGACY2  ", [[GTIN_A, 1]])
+
+    assert _create(client, "PO-LEGACY2").status_code == 409
+    assert _create(client, " PO-LEGACY2 ").status_code == 409
+    # The original receipt is preserved and still the one being served.
+    state = _state(client, "PO-LEGACY2")
+    assert state["items"] == [
+        {"gtin": GTIN_A, "planned_qty": 1, "received_qty": 0}
+    ]
+
+
+def test_scans_book_onto_legacy_padded_receipt(client: TestClient) -> None:
+    _create_legacy(client, "  PO-LEGACY3  ", [[GTIN_A, 2]])
+
+    scan = client.post("/receipts/PO-LEGACY3/scans", json=[GTIN_A])
+    assert scan.status_code == 200
+    assert scan.json()["results"][0]["reconciliation"] == {
+        "conclusion": "matched", "planned_qty": 2, "received_qty": 1
+    }
+    padded_scan = client.post("/receipts/%20PO-LEGACY3%20/scans", json=[GTIN_A])
+    assert padded_scan.json()["results"][0]["reconciliation"][
+        "received_qty"
+    ] == 2
+    assert _received_by_gtin(_state(client, "PO-LEGACY3")) == {GTIN_A: 2}
+
+
+def test_exact_row_wins_over_legacy_padded_and_both_are_kept(
+    client: TestClient,
+) -> None:
+    # Pre-upgrade databases could hold both spellings as separate orders.
+    _create_legacy(client, "PO-SHADOW", [[GTIN_A, 1]])
+    _create_legacy(client, " PO-SHADOW ", [[GTIN_B, 5]])
+
+    # The exactly-canonical row is served; the padded one is shadowed.
+    state = _state(client, "PO-SHADOW")
+    assert state["items"] == [
+        {"gtin": GTIN_A, "planned_qty": 1, "received_qty": 0}
+    ]
+    assert _create(client, "PO-SHADOW").status_code == 409
+    # Both original rows remain stored; nothing is deleted or rewritten.
+    stored = storage._get_connection().execute(
+        "SELECT order_no FROM receipts"
+    ).fetchall()
+    assert sorted(row["order_no"] for row in stored) == [
+        " PO-SHADOW ", "PO-SHADOW"
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Scanning: planned increment up to and beyond the plan
 # ---------------------------------------------------------------------------
 
