@@ -148,6 +148,89 @@ def test_rejected_create_is_whole_order_with_nothing_persisted(
 
 
 # ---------------------------------------------------------------------------
+# Order-number and quantity boundaries (regression)
+# ---------------------------------------------------------------------------
+
+
+def test_order_no_containing_slash_is_rejected_with_422(
+    client: TestClient,
+) -> None:
+    # A slash can never be addressed as one URL path segment: the receipt
+    # would be created but every read/scan would answer 404. Reject up front.
+    response = client.post(
+        "/receipts",
+        json={"order_no": "PO/2026/0001",
+              "items": [{"gtin": GTIN_A, "planned_qty": 1}]},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert "results" not in body
+    assert isinstance(body["detail"], list) and body["detail"]
+
+
+def test_whitespace_padded_order_no_is_a_duplicate_409(
+    client: TestClient,
+) -> None:
+    assert _create(client, "PO-WS").status_code == 201
+    # Visually identical number with surrounding whitespace: same receipt.
+    response = _create(client, "  PO-WS  ")
+    assert response.status_code == 409
+    assert "results" not in response.json()
+    # Symmetrically, a number created padded blocks the plain variant.
+    assert _create(client, "  PO-WS2  ").status_code == 201
+    assert _create(client, "PO-WS2").status_code == 409
+
+
+def test_whitespace_variant_addresses_the_same_receipt(
+    client: TestClient,
+) -> None:
+    _create(client, "PO-WS3", [[GTIN_A, 2]])
+    client.post("/receipts/PO-WS3/scans", json=[GTIN_A])
+
+    padded_read = client.get("/receipts/%20PO-WS3%20")
+    assert padded_read.status_code == 200
+    assert padded_read.json()["order_no"] == "PO-WS3"
+    assert _received_by_gtin(padded_read.json()) == {GTIN_A: 1}
+
+    padded_scan = client.post("/receipts/%20PO-WS3%20/scans", json=[GTIN_A])
+    assert padded_scan.status_code == 200
+    assert padded_scan.json()["results"][0]["reconciliation"] == {
+        "conclusion": "matched", "planned_qty": 2, "received_qty": 2
+    }
+
+
+@pytest.mark.parametrize("qty", [2**63, 2**63 + 1, 10**30])
+def test_create_rejects_quantity_above_sqlite_integer_range(
+    client: TestClient, qty: int
+) -> None:
+    # Beyond the SQLite INTEGER range the insert would explode as an
+    # unhandled OverflowError (500); it must be a structured 422 instead.
+    response = client.post(
+        "/receipts",
+        json={"order_no": "PO-HUGE",
+              "items": [{"gtin": GTIN_A, "planned_qty": qty}]},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert "results" not in body
+    assert isinstance(body["detail"], list) and body["detail"]
+    # Nothing persisted: the order number stays free.
+    assert client.get("/receipts/PO-HUGE").status_code == 404
+
+
+def test_create_accepts_sqlite_integer_max_quantity(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/receipts",
+        json={"order_no": "PO-MAXQTY",
+              "items": [{"gtin": GTIN_A, "planned_qty": 2**63 - 1}]},
+    )
+    assert response.status_code == 201
+    assert response.json()["items"][0]["planned_qty"] == 2**63 - 1
+
+
+# ---------------------------------------------------------------------------
 # Scanning: planned increment up to and beyond the plan
 # ---------------------------------------------------------------------------
 

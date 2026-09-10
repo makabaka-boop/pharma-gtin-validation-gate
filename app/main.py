@@ -42,6 +42,10 @@ from .storage import (
 
 MAX_CODES: int = 100
 MAX_LINES: int = 100
+# SQLite INTEGER is a signed 64-bit value; a planned quantity outside that
+# range cannot be persisted, so it must fail request validation (422)
+# instead of surfacing as an unhandled OverflowError (500) at insert time.
+MAX_PLANNED_QTY: int = 2**63 - 1
 
 Status = Literal["valid", "format_error", "checksum_mismatch"]
 Conclusion = Literal["matched", "excess", "unplanned"]
@@ -108,7 +112,7 @@ class PlannedLineIn(BaseModel):
     """One planned purchase-order line: a valid GTIN and a positive qty."""
 
     gtin: Annotated[str, Field(min_length=1, max_length=128)]
-    planned_qty: Annotated[StrictInt, Field(gt=0)]
+    planned_qty: Annotated[StrictInt, Field(gt=0, le=MAX_PLANNED_QTY)]
 
 
 class CreateReceiptIn(BaseModel):
@@ -121,6 +125,11 @@ class CreateReceiptIn(BaseModel):
     def validate_business_rules(self) -> CreateReceiptIn:
         if not self.order_no.strip():
             raise ValueError("order_no must contain at least one non-blank char")
+        if "/" in self.order_no:
+            # The order number is addressed as a single URL path segment;
+            # with a slash the receipt would be created but unreachable
+            # (every read/scan would 404), so reject it up front.
+            raise ValueError("order_no must not contain '/'")
         gtins = [item.gtin for item in self.items]
         if len(set(gtins)) != len(gtins):
             raise ValueError("items must not contain duplicate GTINs")
@@ -243,8 +252,10 @@ def verify_codes(
 def create_receipt_order(payload: CreateReceiptIn) -> ReceiptCreatedOut:
     """Create a receipt with planned lines.
 
-    A duplicate business order number answers 409; illegal GTINs, repeated
-    GTINs or non-positive quantities fail validation as a whole with 422.
+    A duplicate business order number (compared with surrounding whitespace
+    stripped) answers 409; illegal GTINs, repeated GTINs, quantities outside
+    the positive SQLite-integer range or an order number containing ``/``
+    fail validation as a whole with 422.
     """
     try:
         create_receipt(

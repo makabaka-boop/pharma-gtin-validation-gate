@@ -20,6 +20,11 @@ counts -- the retry is deterministic.
 A process-wide lock serialises write transactions: each batch is an atomic
 "evaluate then increment" step, so concurrent requests can never produce an
 interleaved or half-counted receipt.
+
+Business order numbers are canonicalised (surrounding whitespace stripped)
+before every read and write, so visually identical numbers -- ``"PO-1"``
+versus ``"  PO-1  "`` -- always address the same receipt and can never
+coexist as two separate orders.
 """
 from __future__ import annotations
 
@@ -171,6 +176,18 @@ def reset_for_tests(path: str = ":memory:") -> None:
         _init_db_locked()
 
 
+def _canonical_order_no(order_no: str) -> str:
+    """Return the canonical form of a business order number.
+
+    Surrounding whitespace carries no meaning: ``"PO-1"`` and ``" PO-1 "``
+    are the *same* receipt. Canonicalising at this boundary makes create,
+    read and scan all resolve one key, and turns a whitespace-padded
+    variant of an existing number into a duplicate (409) instead of a
+    second, visually identical order.
+    """
+    return order_no.strip()
+
+
 def create_receipt(order_no: str, lines: list[tuple[str, int]]) -> None:
     """Insert one receipt order and its planned lines in a single transaction.
 
@@ -178,6 +195,7 @@ def create_receipt(order_no: str, lines: list[tuple[str, int]]) -> None:
     Any other SQLite failure becomes :class:`StorageUnavailable` and leaves
     no partial order behind.
     """
+    order_no = _canonical_order_no(order_no)
     with _write_lock:
         try:
             with _transaction() as cursor:
@@ -203,6 +221,7 @@ def get_receipt(order_no: str) -> ReceiptState | None:
     """Return the full order snapshot, or ``None`` if it does not exist."""
     # All statements share one connection; the write lock also serialises
     # reads so two threads never touch the connection mid-transaction.
+    order_no = _canonical_order_no(order_no)
     with _write_lock:
         try:
             connection = _get_connection()
@@ -249,6 +268,7 @@ def record_scan_batch(
     the first increment (and before commit): the transaction is rolled back,
     nothing is booked, and :class:`StorageUnavailable` is raised.
     """
+    order_no = _canonical_order_no(order_no)
     results: list[Reconciliation] = []
     with _write_lock:
         try:
