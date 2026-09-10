@@ -20,6 +20,31 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
    整体返回 **422**，由 Pydantic 给出结构化错误，且**不返回部分 `results`**。
 6. 结构合法的请求即使包含（甚至全是）无效代码，也返回 **200**。
 
+## 收货对账规则
+
+仓库先按采购单创建收货单，再分批提交扫描码。服务在逐码校验的同时累计实收数量：
+
+1. `POST /receipts` 创建收货单：提交唯一业务单号 `order_no` 与至少一条明细，
+   每条明细为**合法 GTIN-14 + 正整数计划量**。
+   - 明细 GTIN 校验位不符或格式非法、同一请求中 GTIN 重复、计划量不是正整数
+     （`0`、负数、`true`、`1.5`、`"2"` 等）：**整体 422**，不留任何残单。
+   - 业务单号重复：**409**。
+2. `POST /receipts/{order_no}/scans` 向收货单提交 1～100 个扫描码（裸数组，边界与
+   `/codes/verify` 相同）。响应在逐码结论之外，对每个**校验通过**的代码追加
+   `reconciliation` 对账结论，并在**同一 SQLite 事务中按输入顺序**递增实收量：
+   - `matched`：该 GTIN 在采购计划内，递增后实收量 ≤ 计划量；
+   - `excess`：计划内但递增后实收量 > 计划量（超收）；
+   - `unplanned`：GTIN 不在采购计划内（计划外商品，`planned_qty` 为 `null`，
+     再次扫描仍计为 unplanned 并继续累计）。
+3. `format_error` / `checksum_mismatch` 的项目**不入账、不产生对账结论**
+   （`reconciliation` 为 `null`），原逐码校验结果仍按顺序完整返回。
+4. 不存在的收货单（建单、扫描、查询）返回 **404**。
+5. 扫描期间任何存储失败都会**回滚整批计数**并返回 **503**（无部分 `results`）；
+   重试同一批得到确定结果——就像失败的请求从未发生。
+6. 应用启动时以 `CREATE TABLE IF NOT EXISTS` 幂等创建 `receipts` 与
+   `receipt_items` 两张表，对已有数据库文件重复启动安全。数据库路径由
+   `RECEIPT_DB_PATH` 环境变量覆盖（默认工作目录下 `receipts.db`）。
+
 ## 可复算示例
 
 有效代码 `07300040109316`（校验位应为 6）：
@@ -91,6 +116,85 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
 
 返回 `{"status": "ok"}`，供容器健康检查使用。
 
+### `POST /receipts`
+
+创建收货单。请求：
+
+```json
+{
+  "order_no": "PO-2026-0001",
+  "items": [
+    {"gtin": "07300040109316", "planned_qty": 2},
+    {"gtin": "00000000000000", "planned_qty": 1}
+  ]
+}
+```
+
+成功 `201`（计划行初始实收量均为 0）：
+
+```json
+{
+  "order_no": "PO-2026-0001",
+  "items": [
+    {"gtin": "07300040109316", "planned_qty": 2, "received_qty": 0},
+    {"gtin": "00000000000000", "planned_qty": 1, "received_qty": 0}
+  ]
+}
+```
+
+业务单号重复返回 `409`；非法 GTIN、重复 GTIN、非正整数数量或空明细整体返回
+`422`（Pydantic 结构化 `detail`，不产生残单）。
+
+### `POST /receipts/{order_no}/scans`
+
+对收货单提交扫描码裸数组。下例中 `07300040109316` 计划量为 2，
+`00000000000017`（校验位 7）不在计划内，`07300040109310` 校验位不符，
+`0730004010-9316` 格式错误：
+
+```json
+[
+  "07300040109316",
+  "00000000000017",
+  "07300040109310",
+  "0730004010-9316",
+  "07300040109316"
+]
+```
+
+`200`（逐码结论保序返回；只有合法码携带 `reconciliation`）：
+
+```json
+{
+  "results": [
+    {"code": "07300040109316", "calculated_check_digit": 6, "status": "valid",
+     "reconciliation": {"conclusion": "matched", "planned_qty": 2,
+                        "received_qty": 1}},
+    {"code": "00000000000017", "calculated_check_digit": 7, "status": "valid",
+     "reconciliation": {"conclusion": "unplanned", "planned_qty": null,
+                        "received_qty": 1}},
+    {"code": "07300040109310", "calculated_check_digit": 6,
+     "status": "checksum_mismatch", "reconciliation": null},
+    {"code": "0730004010-9316", "calculated_check_digit": null,
+     "status": "format_error", "reconciliation": null},
+    {"code": "07300040109316", "calculated_check_digit": 6, "status": "valid",
+     "reconciliation": {"conclusion": "matched", "planned_qty": 2,
+                        "received_qty": 2}}
+  ]
+}
+```
+
+再扫一次 `07300040109316` 即超收：`"conclusion": "excess"`、`"received_qty": 3`。
+不存在的收货单返回 `404`；存储失败时整批回滚并返回 `503`。
+
+验收环境额外识别请求头 `X-Simulate-Storage-Failure: 1`，在首个合法码递增后、
+提交前注入一次存储错误以验证整批回滚与重试确定性；该开关仅在设置环境变量
+`RECEIPT_ENABLE_FAILURE_INJECTION=1` 时生效（默认关闭，生产环境无头）。
+
+### `GET /receipts/{order_no}`
+
+返回收货单累计状态（计划行 + 扫描中登记的计划外行，计划外行 `planned_qty` 为
+`null`）；不存在返回 `404`。
+
 服务启动后还提供交互式文档：`/docs`（Swagger UI）与 `/openapi.json`。
 
 ## 本地运行（Python 3.12）
@@ -113,6 +217,10 @@ pytest
   各状态判定以及“空白/连字符/全角数字不转换”。
 - `tests/test_api.py`：混合批次保序与重复保留、1/100 边界、空数组/超限/非字符串成员/
   非数组请求体/损坏 JSON 的 422 且无部分结果、健康检查。
+- `tests/test_receipts.py`：建单 201/重复 409/非法 GTIN、重复 GTIN 与非正数量整体
+  422 且不留残单；计划内逐码递增 matched→excess、计划外识别并持续累计、无效码不计数
+  且无对账结论、未知单 404；注入存储失败后整批 503 回滚，重试结果确定、先前已提交
+  计数不受影响。
 
 ## Docker Compose
 
@@ -127,8 +235,10 @@ curl -s localhost:${API_PORT:-8000}/health
 ### 一次性验收服务 `verify`
 
 `verify` 复用同一镜像，等待 `api` 健康后对**真实 HTTP 服务**执行端到端验收：
-混合批次每件独立复算校验位、核对保序与重复保留、全部非法结构必须 422 且无部分结果，
-然后打印每件的放行结论并以 0/1 退出：
+混合批次每件独立复算校验位、核对保序与重复保留、全部非法结构必须 422 且无部分结果；
+随后建单（含重复单号 409 与非法明细 422）、分两批扫描验证 matched→excess 与
+unplanned、确认无效码不计数，并通过存储故障注入验证整批 503 回滚与确定性重试，
+然后以 0/1 退出：
 
 ```bash
 docker compose run --rm verify
@@ -142,12 +252,14 @@ docker compose run --rm verify
 app/
   __init__.py
   gtin14.py       # 14 位 ASCII 数字判定与 GTIN-14 校验位公式（无占位实现）
-  main.py         # FastAPI 应用：Pydantic 固定请求边界与响应模型
+  storage.py      # SQLite 收货单/明细建表、事务内按序递增、整批回滚
+  main.py         # FastAPI 应用：Pydantic 固定请求边界、对账模型与响应
 scripts/
   acceptance.py   # 一次性验收：纯标准库访问真实服务并独立复算
 tests/
   test_gtin14.py  # 公式与单码规则
-  test_api.py     # 接口边界、状态码与保序/重复语义
+  test_api.py     # /codes/verify 接口边界、状态码与保序/重复语义
+  test_receipts.py  # 建单/对账/计划外/无效码不计数/事务回滚与确定性重试
 Dockerfile
 docker-compose.yml
 requirements.txt

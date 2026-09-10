@@ -8,6 +8,13 @@ services:
       # Inside the container uvicorn always listens on 8000; only the
       # published host port is overridable through API_PORT.
       API_PORT: "8000"
+      # Enables the X-Simulate-Storage-Failure test seam used only by the
+      # one-shot acceptance service to prove whole-batch rollback. The seam
+      # stays inert without that explicit request header.
+      RECEIPT_ENABLE_FAILURE_INJECTION: "1"
+      RECEIPT_DB_PATH: "/data/receipts.db"
+    volumes:
+      - receipt-data:/data
     ports:
       # API_PORT defaults to 8000 on the host; override it with
       # `API_PORT=9000 docker compose up -d --build`.
@@ -43,3 +50,6 @@ services:
     restart: "no"
     profiles:
       - verify
+
+volumes:
+  receipt-data:
