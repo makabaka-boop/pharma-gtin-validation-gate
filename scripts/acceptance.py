@@ -658,6 +658,14 @@ def audit_cold_chain_assessments() -> None:
         "span over seven days": {
             "samples": _cc_samples([0, 7 * 24 * 60 + 1], [5.0, 6.0])
         },
+        # Regression: huge magnitudes once overflowed the integral to
+        # infinity, crashed the response with 500 and kept the number.
+        "huge temperature": {"samples": _cc_samples([0, 60], [1e308, 1e308])},
+        "huge negative temperature": {
+            "samples": _cc_samples([0, 60], [-1e308, -1e308])
+        },
+        "huge zone bound": {"min_temp": -1e308,
+                            "samples": _cc_samples([0, 60], [5.0, 6.0])},
     }
     failed_ids: list[str] = []
     for position, (label, overrides) in enumerate(rejected.items()):

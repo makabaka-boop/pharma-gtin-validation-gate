@@ -38,6 +38,16 @@ MAX_SAMPLES: int = 10_000
 # is a data-entry error, not a shipment.
 MAX_SPAN: timedelta = timedelta(days=7)
 
+# Temperatures are stored as SQLite REAL (IEEE 754 double) and feed the
+# deviation/trapezoidal arithmetic. Bounding every temperature input (zone
+# bounds and samples alike) to 1e100 deg C keeps that arithmetic finite with
+# enormous headroom -- the worst case is a deviation of 2e100 integrated
+# over the maximal seven-day span, about 2e104 degree-minutes, nowhere near
+# the float64 ceiling of ~1.8e308. A larger magnitude would overflow to
+# infinity mid-computation, so it must fail request validation (422) instead
+# of poisoning a persisted summary with non-finite numbers.
+MAX_ABS_TEMP: float = 1e100
+
 CONCLUSION_COMPLIANT = "compliant"
 CONCLUSION_EXCURSION = "excursion"
 

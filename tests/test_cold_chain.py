@@ -277,6 +277,50 @@ def test_get_unknown_assessment_is_404(client: TestClient) -> None:
     assert "detail" in response.json()
 
 
+def test_huge_temperature_samples_are_422_and_leave_no_record(
+    client: TestClient,
+) -> None:
+    # Regression: 1e308 passed the finite check, the trapezoidal sum
+    # overflowed to infinity, the response crashed with 500 *after* commit,
+    # and the assessment number stayed occupied (GET 500, re-POST 409).
+    _create_receipt(client)
+    for huge in (1e308, -1e308, 1.5e100):
+        response = _assess(
+            client, "CC-HUGE", samples=_samples([0, 60], [huge, huge])
+        )
+        assert response.status_code == 422, huge
+        assert isinstance(response.json()["detail"], list)
+    # Nothing persisted: the number is unknown and immediately reusable.
+    assert client.get("/cold-chain-assessments/CC-HUGE").status_code == 404
+    assert _assess(client, "CC-HUGE").status_code == 201
+    stored = storage._get_connection().execute(
+        "SELECT COUNT(*) AS n FROM cold_chain_assessments"
+    ).fetchone()
+    assert stored["n"] == 1  # only the reused, sane request
+
+
+def test_huge_zone_bounds_are_422(client: TestClient) -> None:
+    _create_receipt(client)
+    for zone in ((-1e308, 8.0), (2.0, 1e308), (-1e308, 1e308), (-1.5e100, 8.0)):
+        response = _assess(client, min_temp=zone[0], max_temp=zone[1])
+        assert response.status_code == 422, zone
+
+
+def test_temperature_magnitude_bound_is_inclusive(client: TestClient) -> None:
+    _create_receipt(client)
+    # Exactly +/-1e100 stays computable: deviation 1e100 over 60 minutes.
+    samples = _samples([0, 60], [1e100, 1e100])
+    response = _assess(client, "CC-EDGE", samples=samples)
+    assert response.status_code == 201
+    summary = response.json()["summary"]
+    assert summary["segments"][0]["peak_deviation"] == 1e100
+    assert summary["total_degree_minutes"] == 6e101  # 1e100 * 60 min
+    # Just past the bound is rejected, even without any overflow risk.
+    assert _assess(
+        client, "CC-OVER", samples=_samples([0, 60], [1.01e100, 5.0])
+    ).status_code == 422
+
+
 def test_invalid_temperature_zone_is_422(client: TestClient) -> None:
     _create_receipt(client)
     for zone in ((8.0, 2.0), (5.0, 5.0)):

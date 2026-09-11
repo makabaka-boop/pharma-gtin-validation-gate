@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, Field, StrictInt, model_validator
 
 from .cold_chain import (
+    MAX_ABS_TEMP,
     MAX_SAMPLES,
     MAX_SPAN,
     MIN_SAMPLES,
@@ -254,7 +255,9 @@ class ColdChainSampleIn(BaseModel):
     """One raw temperature sample: a timezone-aware instant and a value."""
 
     recorded_at: AwareDatetime
-    temperature: float = Field(allow_inf_nan=False)
+    temperature: Annotated[
+        float, Field(allow_inf_nan=False, ge=-MAX_ABS_TEMP, le=MAX_ABS_TEMP)
+    ]
 
 
 class CreateColdChainAssessmentIn(BaseModel):
@@ -262,8 +265,12 @@ class CreateColdChainAssessmentIn(BaseModel):
 
     assessment_id: Annotated[str, Field(min_length=1, max_length=128)]
     order_no: Annotated[str, Field(min_length=1, max_length=128)]
-    min_temp: float = Field(allow_inf_nan=False)
-    max_temp: float = Field(allow_inf_nan=False)
+    min_temp: Annotated[
+        float, Field(allow_inf_nan=False, ge=-MAX_ABS_TEMP, le=MAX_ABS_TEMP)
+    ]
+    max_temp: Annotated[
+        float, Field(allow_inf_nan=False, ge=-MAX_ABS_TEMP, le=MAX_ABS_TEMP)
+    ]
     samples: Annotated[
         list[ColdChainSampleIn],
         Field(min_length=MIN_SAMPLES, max_length=MAX_SAMPLES),
