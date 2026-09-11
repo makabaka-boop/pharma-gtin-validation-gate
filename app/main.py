@@ -16,25 +16,53 @@ Goods receipt (purchase-order reconciliation):
   conclusion. Invalid codes are neither booked nor concluded.
 * ``GET /receipts/{order_no}`` returns the cumulative planned/received
   state used to prove rollback determinism.
+
+Cold-chain quality assessment:
+
+* ``POST /cold-chain-assessments`` registers one cold-chain record for a
+  completed receipt: a unique assessment number, the allowed temperature
+  zone and the strictly time-increasing sample points. Consecutive
+  out-of-zone samples are merged into excursion segments and the deviation
+  is integrated trapezoidally, yielding a reviewable transport
+  temperature-control conclusion (persisted with the raw samples).
+* ``GET /cold-chain-assessments/{assessment_id}`` returns the same
+  deterministic document; an unknown assessment answers 404.
 """
 from __future__ import annotations
 
+import math
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import Body, FastAPI, Header
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictInt, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, StrictInt, model_validator
 
+from .cold_chain import (
+    MAX_SAMPLES,
+    MAX_SPAN,
+    MIN_SAMPLES,
+    AssessmentSummary,
+    ExcursionSegment,
+    SamplePoint,
+    assess_cold_chain,
+)
 from .gtin14 import STATUS_VALID, CodeResult, evaluate_code
 from .storage import (
+    AssessmentAlreadyExists,
+    ColdChainAssessmentRecord,
     OrderAlreadyExists,
     PlannedLine,
     ReceiptState,
     Reconciliation,
     StorageUnavailable,
+    create_cold_chain_assessment,
     create_receipt,
+    get_cold_chain_assessment,
     get_receipt,
     init_db,
     record_scan_batch,
@@ -49,6 +77,7 @@ MAX_PLANNED_QTY: int = 2**63 - 1
 
 Status = Literal["valid", "format_error", "checksum_mismatch"]
 Conclusion = Literal["matched", "excess", "unplanned"]
+ColdChainConclusion = Literal["compliant", "excursion"]
 
 # The storage-failure test seam is inert unless explicitly enabled, so a
 # stray header in production can never destroy a batch. The acceptance
@@ -68,12 +97,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Package Code Receiving API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Receive scanned GTIN-14 package codes for pharmaceutical goods "
         "receipt and return an order-preserving, duplicate-preserving "
         "verdict for each code, with purchase-order reconciliation for "
-        "created receipt orders."
+        "created receipt orders and cold-chain temperature assessment for "
+        "completed receipts."
     ),
     lifespan=lifespan,
 )
@@ -86,6 +116,37 @@ def _storage_unavailable_handler(_, exc: StorageUnavailable) -> JSONResponse:
         status_code=503,
         content={"detail": f"Storage temporarily unavailable: {exc}"},
         headers={"Retry-After": "1"},
+    )
+
+
+def _sanitize_non_finite(value: object) -> object:
+    """Replace non-finite floats with string tokens inside error details.
+
+    A request body may legally carry ``NaN``/``Infinity`` tokens (Python's
+    JSON parser accepts them); when such a value fails validation the stock
+    FastAPI handler would embed the raw float in ``detail[].input`` and
+    crash serialising the 422 response. Finite values pass through
+    untouched, so the envelope is byte-identical to the default handler
+    for every ordinary validation error.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+def _request_validation_handler(_, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": _sanitize_non_finite(jsonable_encoder(exc.errors()))
+        },
     )
 
 
@@ -184,6 +245,92 @@ class ScanResponse(BaseModel):
     results: list[ScanItem]
 
 
+# ---------------------------------------------------------------------------
+# Cold-chain assessment models
+# ---------------------------------------------------------------------------
+
+
+class ColdChainSampleIn(BaseModel):
+    """One raw temperature sample: a timezone-aware instant and a value."""
+
+    recorded_at: AwareDatetime
+    temperature: float = Field(allow_inf_nan=False)
+
+
+class CreateColdChainAssessmentIn(BaseModel):
+    """Body for ``POST /cold-chain-assessments``."""
+
+    assessment_id: Annotated[str, Field(min_length=1, max_length=128)]
+    order_no: Annotated[str, Field(min_length=1, max_length=128)]
+    min_temp: float = Field(allow_inf_nan=False)
+    max_temp: float = Field(allow_inf_nan=False)
+    samples: Annotated[
+        list[ColdChainSampleIn],
+        Field(min_length=MIN_SAMPLES, max_length=MAX_SAMPLES),
+    ]
+
+    @model_validator(mode="after")
+    def validate_business_rules(self) -> CreateColdChainAssessmentIn:
+        if not self.assessment_id.strip():
+            raise ValueError(
+                "assessment_id must contain at least one non-blank char"
+            )
+        if "/" in self.assessment_id:
+            # Like order_no, the assessment number is addressed as a single
+            # URL path segment; a slash would make it unreachable.
+            raise ValueError("assessment_id must not contain '/'")
+        if not self.min_temp < self.max_temp:
+            raise ValueError("min_temp must be strictly below max_temp")
+        times = [sample.recorded_at for sample in self.samples]
+        if any(later <= earlier for earlier, later in zip(times, times[1:])):
+            raise ValueError("samples must be strictly increasing in recorded_at")
+        if times[-1] - times[0] > MAX_SPAN:
+            raise ValueError("samples must not span more than seven days")
+        return self
+
+
+class ColdChainSampleOut(BaseModel):
+    """One raw sample as persisted."""
+
+    recorded_at: datetime
+    temperature: float
+
+
+class ColdChainSegmentOut(BaseModel):
+    """One merged excursion segment with its trapezoidal integrals."""
+
+    start: datetime
+    end: datetime
+    duration_minutes: float
+    degree_minutes: float
+    sample_count: int
+    peak_deviation: float
+
+
+class ColdChainSummaryOut(BaseModel):
+    """The reviewable transport temperature-control conclusion."""
+
+    sample_count: int
+    span_minutes: float
+    out_of_range_samples: int
+    segment_count: int
+    total_duration_minutes: float
+    total_degree_minutes: float
+    conclusion: ColdChainConclusion
+    segments: list[ColdChainSegmentOut]
+
+
+class ColdChainAssessmentOut(BaseModel):
+    """Full assessment document: zone, raw samples and persisted summary."""
+
+    assessment_id: str
+    order_no: str
+    min_temp: float
+    max_temp: float
+    samples: list[ColdChainSampleOut]
+    summary: ColdChainSummaryOut
+
+
 def _line_out(line: PlannedLine) -> PlannedLineOut:
     return PlannedLineOut(
         gtin=line.gtin,
@@ -196,6 +343,46 @@ def _state_out(state: ReceiptState) -> ReceiptStateOut:
     return ReceiptStateOut(
         order_no=state.order_no,
         items=[_line_out(line) for line in state.items],
+    )
+
+
+def _segment_out(segment: ExcursionSegment) -> ColdChainSegmentOut:
+    return ColdChainSegmentOut(
+        start=segment.start,
+        end=segment.end,
+        duration_minutes=segment.duration_minutes,
+        degree_minutes=segment.degree_minutes,
+        sample_count=segment.sample_count,
+        peak_deviation=segment.peak_deviation,
+    )
+
+
+def _summary_out(summary: AssessmentSummary) -> ColdChainSummaryOut:
+    return ColdChainSummaryOut(
+        sample_count=summary.sample_count,
+        span_minutes=summary.span_minutes,
+        out_of_range_samples=summary.out_of_range_samples,
+        segment_count=summary.segment_count,
+        total_duration_minutes=summary.total_duration_minutes,
+        total_degree_minutes=summary.total_degree_minutes,
+        conclusion=summary.conclusion,  # type: ignore[arg-type]
+        segments=[_segment_out(segment) for segment in summary.segments],
+    )
+
+
+def _assessment_out(record: ColdChainAssessmentRecord) -> ColdChainAssessmentOut:
+    return ColdChainAssessmentOut(
+        assessment_id=record.assessment_id,
+        order_no=record.order_no,
+        min_temp=record.min_temp,
+        max_temp=record.max_temp,
+        samples=[
+            ColdChainSampleOut(
+                recorded_at=sample.recorded_at, temperature=sample.temperature
+            )
+            for sample in record.samples
+        ],
+        summary=_summary_out(record.summary),
     )
 
 
@@ -359,3 +546,78 @@ def read_receipt(order_no: str) -> ReceiptStateOut:
             content={"detail": f"unknown order_no {order_no!r}"},
         )
     return _state_out(state)
+
+
+# ---------------------------------------------------------------------------
+# Cold-chain assessment endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/cold-chain-assessments",
+    response_model=ColdChainAssessmentOut,
+    status_code=201,
+    tags=["cold-chain"],
+    summary="Register a cold-chain record and assess temperature control",
+)
+def create_assessment(
+    payload: CreateColdChainAssessmentIn,
+) -> ColdChainAssessmentOut:
+    """Assess one completed receipt's transport temperature curve.
+
+    The receipt must exist (404 otherwise). A repeated assessment number
+    answers 409; an unordered zone, fewer than two samples, non-strictly
+    increasing timestamps or a span over seven days fail validation as a
+    whole with 422. Failed requests persist nothing. On success the raw
+    samples and the computed summary are stored atomically and returned.
+    """
+    # Resolve the receipt before computing anything so a wrong order number
+    # is a clean 404 even for a structurally valid body.
+    state = get_receipt(payload.order_no)
+    if state is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=404,
+            content={"detail": f"unknown order_no {payload.order_no!r}"},
+        )
+
+    points = [
+        SamplePoint(recorded_at=sample.recorded_at, temperature=sample.temperature)
+        for sample in payload.samples
+    ]
+    summary = assess_cold_chain(payload.min_temp, payload.max_temp, points)
+    assessment_id = payload.assessment_id.strip()
+    try:
+        create_cold_chain_assessment(
+            assessment_id,
+            state.order_no,
+            payload.min_temp,
+            payload.max_temp,
+            points,
+            summary,
+        )
+    except AssessmentAlreadyExists:
+        # 409, not 422: the body itself is valid, only the number repeats.
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=409,
+            content={"detail": f"assessment_id {assessment_id!r} already exists"},
+        )
+    record = get_cold_chain_assessment(assessment_id)
+    assert record is not None  # just created above
+    return _assessment_out(record)
+
+
+@app.get(
+    "/cold-chain-assessments/{assessment_id}",
+    response_model=ColdChainAssessmentOut,
+    tags=["cold-chain"],
+    summary="Read the deterministic result of a cold-chain assessment",
+)
+def read_assessment(assessment_id: str) -> ColdChainAssessmentOut:
+    """Return the persisted assessment (404 if the number is unknown)."""
+    record = get_cold_chain_assessment(assessment_id)
+    if record is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=404,
+            content={"detail": f"unknown assessment_id {assessment_id!r}"},
+        )
+    return _assessment_out(record)

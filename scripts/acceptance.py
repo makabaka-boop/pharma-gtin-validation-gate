@@ -16,6 +16,13 @@ It audits both feature areas:
    unplanned GTINs, never book malformed/checksum-bad codes, return 404 for
    unknown orders, and roll back the whole batch on storage failure so a
    retry produces exactly the same counts as if the failure never happened.
+3. Cold-chain assessment -- register a temperature record for a completed
+   receipt (201), verify the trapezoidal integration of multiple excursion
+   segments against an independent recomputation, confirm the persisted
+   document is served identically on read, and prove the error contract:
+   duplicate assessment number 409, unknown receipt 404, invalid zone /
+   too few samples / non-increasing time / span over seven days 422, and
+   no residual records after any failed request.
 
 Usage (from the repository root):
 
@@ -29,10 +36,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime, timedelta
 
 API_BASE = os.environ.get("API_BASE", "http://api:8000")
 VERIFY_URL = f"{API_BASE}/codes/verify"
 RECEIPTS_URL = f"{API_BASE}/receipts"
+COLD_CHAIN_URL = f"{API_BASE}/cold-chain-assessments"
 HEALTH_URL = f"{API_BASE}/health"
 
 GTIN_A = "07300040109316"   # valid, check digit 6
@@ -427,12 +436,275 @@ def audit_rollback_and_deterministic_retry() -> None:
     check(_received_map(state) == {GTIN_A: 5}, "final cumulative received_qty is 5")
 
 
+# ---------------------------------------------------------------------------
+# Cold-chain assessment audits
+# ---------------------------------------------------------------------------
+
+CC_BASE = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
+
+
+def _cc_samples(offsets: list[float], temps: list[float]) -> list[dict]:
+    return [
+        {
+            "recorded_at": (CC_BASE + timedelta(minutes=offset))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "temperature": temp,
+        }
+        for offset, temp in zip(offsets, temps)
+    ]
+
+
+def expected_cold_chain_summary(
+    min_temp: float, max_temp: float, samples: list[dict]
+) -> dict:
+    """Independent re-implementation used to audit the service output.
+
+    Merges consecutive out-of-zone samples into segments and integrates the
+    deviation trapezoidally between adjacent points, exactly as specified.
+    """
+    points = [
+        (
+            datetime.fromisoformat(
+                sample["recorded_at"].replace("Z", "+00:00")
+            ),
+            sample["temperature"],
+        )
+        for sample in samples
+    ]
+    deviations = [
+        0.0
+        if min_temp <= temp <= max_temp
+        else (min_temp - temp if temp < min_temp else temp - max_temp)
+        for _, temp in points
+    ]
+
+    segments: list[dict] = []
+    index = 0
+    while index < len(points):
+        if deviations[index] == 0.0:
+            index += 1
+            continue
+        run_end = index
+        while run_end + 1 < len(points) and deviations[run_end + 1] > 0.0:
+            run_end += 1
+        degree_minutes = 0.0
+        for k in range(index, run_end):
+            interval = (points[k + 1][0] - points[k][0]).total_seconds() / 60
+            degree_minutes += (deviations[k] + deviations[k + 1]) / 2 * interval
+        segments.append(
+            {
+                "start": points[index][0],
+                "end": points[run_end][0],
+                "duration_minutes": round(
+                    (points[run_end][0] - points[index][0]).total_seconds()
+                    / 60,
+                    2,
+                ),
+                "degree_minutes": round(degree_minutes, 2),
+                "sample_count": run_end - index + 1,
+                "peak_deviation": round(max(deviations[index : run_end + 1]), 2),
+            }
+        )
+        index = run_end + 1
+
+    return {
+        "sample_count": len(points),
+        "span_minutes": round(
+            (points[-1][0] - points[0][0]).total_seconds() / 60, 2
+        ),
+        "out_of_range_samples": sum(1 for d in deviations if d > 0.0),
+        "segment_count": len(segments),
+        "total_duration_minutes": round(
+            sum(s["duration_minutes"] for s in segments), 2
+        ),
+        "total_degree_minutes": round(
+            sum(s["degree_minutes"] for s in segments), 2
+        ),
+        "conclusion": "excursion" if segments else "compliant",
+        "segments": segments,
+    }
+
+
+def _check_summary(actual: dict, expected: dict, label: str) -> None:
+    check(
+        actual["sample_count"] == expected["sample_count"]
+        and actual["span_minutes"] == expected["span_minutes"]
+        and actual["out_of_range_samples"]
+        == expected["out_of_range_samples"]
+        and actual["segment_count"] == expected["segment_count"]
+        and actual["total_duration_minutes"]
+        == expected["total_duration_minutes"]
+        and actual["total_degree_minutes"] == expected["total_degree_minutes"]
+        and actual["conclusion"] == expected["conclusion"],
+        f"{label}: scalar summary matches independent recomputation",
+    )
+    actual_segments = actual["segments"]
+    check(
+        len(actual_segments) == len(expected["segments"]),
+        f"{label}: {len(expected['segments'])} excursion segment(s) returned",
+    )
+    for position, (got, want) in enumerate(
+        zip(actual_segments, expected["segments"])
+    ):
+        check(
+            got["start"] == want["start"].isoformat().replace("+00:00", "Z")
+            and got["end"] == want["end"].isoformat().replace("+00:00", "Z")
+            and got["duration_minutes"] == want["duration_minutes"]
+            and got["degree_minutes"] == want["degree_minutes"]
+            and got["sample_count"] == want["sample_count"]
+            and got["peak_deviation"] == want["peak_deviation"],
+            f"{label}: segment {position} trapezoidal integrals match "
+            f"(duration {want['duration_minutes']} min, "
+            f"{want['degree_minutes']} degree-minutes)",
+        )
+
+
+def audit_cold_chain_assessments() -> None:
+    print()
+    print("== cold-chain: compliant transport and persisted document ==")
+    suffix = int(time.time())
+    order_no = f"ACC-CC-{suffix}"
+    status_code, _ = _create_order(order_no, [[GTIN_A, 5]])
+    check(status_code == 201, f"assessment receipt created: HTTP 201 "
+                              f"(got {status_code})")
+
+    def post_assessment(assessment_id: str, body: dict) -> tuple[int, object]:
+        return request_json(
+            COLD_CHAIN_URL,
+            {
+                "assessment_id": assessment_id,
+                "order_no": order_no,
+                "min_temp": 2.0,
+                "max_temp": 8.0,
+                **body,
+            },
+        )
+
+    # Fully in-zone transport: no segments, zero totals, "compliant".
+    compliant_id = f"ACC-CCOK-{suffix}"
+    compliant_samples = _cc_samples([0, 60, 120], [4.5, 8.0, 2.0])
+    status_code, created = post_assessment(
+        compliant_id, {"samples": compliant_samples}
+    )
+    check(status_code == 201, f"compliant assessment: HTTP 201 (got {status_code})")
+    if status_code == 201:
+        check(created["assessment_id"] == compliant_id
+              and created["order_no"] == order_no
+              and created["samples"] == compliant_samples,
+              "assessment echoes id, order and raw samples")
+        _check_summary(
+            created["summary"],
+            expected_cold_chain_summary(2.0, 8.0, compliant_samples),
+            "compliant",
+        )
+        status_code, fetched = get_json(f"{COLD_CHAIN_URL}/{compliant_id}")
+        check(status_code == 200 and fetched == created,
+              "GET returns the identical deterministic document")
+
+    print()
+    print("== cold-chain: multiple excursion segments, trapezoidal integrals ==")
+    excursion_id = f"ACC-CCX-{suffix}"
+    excursion_samples = _cc_samples(
+        [0, 30, 60, 90, 120, 150, 180],
+        [5.0, 9.0, 10.0, 6.0, 1.0, 0.5, 4.0],
+    )
+    status_code, created = post_assessment(
+        excursion_id, {"samples": excursion_samples}
+    )
+    check(status_code == 201, f"excursion assessment: HTTP 201 (got {status_code})")
+    if status_code == 201:
+        expected = expected_cold_chain_summary(2.0, 8.0, excursion_samples)
+        check(expected["segment_count"] == 2,
+              "audit fixture itself yields two excursion segments")
+        _check_summary(created["summary"], expected, "excursion")
+        status_code, fetched = get_json(f"{COLD_CHAIN_URL}/{excursion_id}")
+        check(status_code == 200 and fetched == created,
+              "GET read-back is consistent with the created document")
+
+    print()
+    print("== cold-chain: 409 / 404 / 422 error contract, no residual records ==")
+    status_code, body = post_assessment(excursion_id, {"samples": excursion_samples})
+    check(status_code == 409,
+          f"duplicate assessment number: HTTP 409 (got {status_code})")
+    check(isinstance(body, dict) and "detail" in body,
+          "409 body carries the error envelope")
+
+    status_code, body = request_json(
+        COLD_CHAIN_URL,
+        {
+            "assessment_id": f"ACC-CC404-{suffix}",
+            "order_no": "NO-SUCH-ORDER",
+            "min_temp": 2.0,
+            "max_temp": 8.0,
+            "samples": _cc_samples([0, 60], [5.0, 6.0]),
+        },
+    )
+    check(status_code == 404,
+          f"unknown receipt: HTTP 404 (got {status_code})")
+
+    status_code, _ = get_json(f"{COLD_CHAIN_URL}/NO-SUCH-ASSESSMENT")
+    check(status_code == 404, "read unknown assessment: HTTP 404")
+
+    rejected = {
+        "inverted zone": {"min_temp": 8.0, "max_temp": 2.0,
+                          "samples": _cc_samples([0, 60], [5.0, 6.0])},
+        "degenerate zone": {"min_temp": 5.0, "max_temp": 5.0,
+                            "samples": _cc_samples([0, 60], [5.0, 6.0])},
+        "single sample": {"samples": _cc_samples([0], [5.0])},
+        "empty samples": {"samples": []},
+        "equal timestamps": {"samples": _cc_samples([0, 0], [5.0, 6.0])},
+        "decreasing time": {"samples": _cc_samples([60, 0], [5.0, 6.0])},
+        "span over seven days": {
+            "samples": _cc_samples([0, 7 * 24 * 60 + 1], [5.0, 6.0])
+        },
+    }
+    failed_ids: list[str] = []
+    for position, (label, overrides) in enumerate(rejected.items()):
+        assessment_id = f"ACC-CCBAD-{position}-{suffix}"
+        failed_ids.append(assessment_id)
+        status_code, body = post_assessment(assessment_id, overrides)
+        check(status_code == 422,
+              f"{label}: HTTP 422 (got {status_code})")
+        check(isinstance(body, dict)
+              and isinstance(body.get("detail"), list) and body["detail"],
+              f"{label}: structured Pydantic 'detail' list present")
+
+    # Exactly seven days is still acceptable (boundary is inclusive).
+    boundary_id = f"ACC-CC7D-{suffix}"
+    status_code, _ = post_assessment(
+        boundary_id, {"samples": _cc_samples([0, 7 * 24 * 60], [5.0, 6.0])}
+    )
+    check(status_code == 201,
+          f"span of exactly seven days: HTTP 201 (got {status_code})")
+
+    # No failed request left anything behind: every rejected number is
+    # still unknown, and reusing one succeeds as a complete new record.
+    for assessment_id in failed_ids:
+        status_code, _ = get_json(f"{COLD_CHAIN_URL}/{assessment_id}")
+        check(status_code == 404,
+              f"failed request left no record for {assessment_id!r}")
+    reused_samples = _cc_samples([0, 30, 60], [9.0, 9.0, 5.0])
+    status_code, created = post_assessment(
+        failed_ids[0], {"samples": reused_samples}
+    )
+    check(status_code == 201,
+          f"reused assessment number after 422: HTTP 201 (got {status_code})")
+    if status_code == 201:
+        _check_summary(
+            created["summary"],
+            expected_cold_chain_summary(2.0, 8.0, reused_samples),
+            "reused",
+        )
+
+
 def main() -> int:
     wait_for_health()
     audit_mixed_batch()
     audit_rejections()
     audit_receipt_lifecycle()
     audit_rollback_and_deterministic_retry()
+    audit_cold_chain_assessments()
 
     print()
     if failures:
@@ -441,7 +713,10 @@ def main() -> int:
     print("ACCEPTANCE PASSED: per-code verdicts are order-preserving and")
     print("recomputable; planned receipts increment to matched/excess, unplanned")
     print("goods are identified, invalid codes never book, and rolled-back")
-    print("batches retry with deterministic counts.")
+    print("batches retry with deterministic counts. Cold-chain assessments")
+    print("merge excursions into segments with exact trapezoidal integrals,")
+    print("serve identical documents on read, and keep no residue after")
+    print("rejected requests.")
     return 0
 
 

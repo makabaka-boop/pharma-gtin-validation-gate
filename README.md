@@ -53,6 +53,37 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
    `receipt_items` 两张表，对已有数据库文件重复启动安全。数据库路径由
    `RECEIPT_DB_PATH` 环境变量覆盖（默认工作目录下 `receipts.db`）。
 
+## 冷链评估规则
+
+药品完成收货后，质量人员为收货单登记一条冷链记录：唯一评估号、允许温区与
+按时间严格递增的采样点。服务把**连续越界采样归并为异常区段**，按相邻点做
+**梯形积分**，得出可复查的运输温控结论，并将原始采样与摘要一并持久化：
+
+1. `POST /cold-chain-assessments` 创建评估。请求体：
+   - `assessment_id`：唯一评估号（1～128 字符，忽略首尾空白比较，空白变体
+     按重复处理；不得含 `/`，否则无法作为单个 URL 路径段寻址）；
+   - `order_no`：已存在的收货单号（按收货单同一规范化规则寻址，含升级前
+     落库的空白旧单）；
+   - `min_temp` / `max_temp`：允许温区（°C），必须有限且
+     `min_temp < max_temp`；边界上的温度视为**区内**；
+   - `samples`：2～10000 个采样点，每点为 `recorded_at`（ISO-8601，必须带
+     时区偏移）与 `temperature`（有限数值）。`recorded_at` 必须**严格递增**
+     （同一瞬间的不同时区写法也算相等），首末跨度**不得超过七天**（恰好
+     七天允许）。
+2. 越界（温度在温区之外）的相邻采样归并为一个异常区段；每个区段给出
+   起止时刻、持续分钟数、偏离温区的**度分钟**（相邻点间偏差按梯形积分）、
+   采样点数与峰值偏差。单个孤立越界点构成持续 0 分钟、度分钟为 0 的区段。
+   摘要汇总样本数、总跨度、越界点数、区段数、累计持续分钟与累计度分钟
+   （恰为各区段显示值之和），结论为 `compliant`（全程合规）或
+   `excursion`（存在越界）。所有计算值**按分钟保留两位小数**。
+3. 原始采样与摘要在**同一事务**中写入 `cold_chain_assessments` 与
+   `cold_chain_samples` 两表（随启动迁移幂等创建，外键关联现有收货单）。
+   `GET /cold-chain-assessments/{assessment_id}` 返回与创建时**同一份**
+   确定性文档。
+4. 评估号重复：**409**；收货单不存在：**404**；温区无效、采样点不足、
+   时间未严格递增或跨度超过七天：**422**（Pydantic 结构化 `detail`）。
+   任何失败请求都**不留记录**——评估号可原样重新提交。
+
 ## 可复算示例
 
 有效代码 `07300040109316`（校验位应为 6）：
@@ -204,6 +235,75 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
 返回收货单累计状态（计划行 + 扫描中登记的计划外行，计划外行 `planned_qty` 为
 `null`）；不存在返回 `404`。
 
+### `POST /cold-chain-assessments`
+
+为已完成收货的收货单登记冷链记录并立即得到温控结论。请求：
+
+```json
+{
+  "assessment_id": "CC-2026-0001",
+  "order_no": "PO-2026-0001",
+  "min_temp": 2.0,
+  "max_temp": 8.0,
+  "samples": [
+    {"recorded_at": "2026-09-01T08:00:00Z", "temperature": 5.0},
+    {"recorded_at": "2026-09-01T08:30:00Z", "temperature": 9.0},
+    {"recorded_at": "2026-09-01T09:00:00Z", "temperature": 10.0},
+    {"recorded_at": "2026-09-01T09:30:00Z", "temperature": 6.0},
+    {"recorded_at": "2026-09-01T10:00:00Z", "temperature": 1.0},
+    {"recorded_at": "2026-09-01T10:30:00Z", "temperature": 0.5},
+    {"recorded_at": "2026-09-01T11:00:00Z", "temperature": 4.0}
+  ]
+}
+```
+
+成功 `201`（两个越界区段：高于上限一段、低于下限一段；度分钟按相邻点
+梯形积分，如首段 `(1 + 2) / 2 × 30 = 45.0`）：
+
+```json
+{
+  "assessment_id": "CC-2026-0001",
+  "order_no": "PO-2026-0001",
+  "min_temp": 2.0,
+  "max_temp": 8.0,
+  "samples": [
+    {"recorded_at": "2026-09-01T08:00:00Z", "temperature": 5.0},
+    {"recorded_at": "2026-09-01T08:30:00Z", "temperature": 9.0},
+    {"recorded_at": "2026-09-01T09:00:00Z", "temperature": 10.0},
+    {"recorded_at": "2026-09-01T09:30:00Z", "temperature": 6.0},
+    {"recorded_at": "2026-09-01T10:00:00Z", "temperature": 1.0},
+    {"recorded_at": "2026-09-01T10:30:00Z", "temperature": 0.5},
+    {"recorded_at": "2026-09-01T11:00:00Z", "temperature": 4.0}
+  ],
+  "summary": {
+    "sample_count": 7,
+    "span_minutes": 180.0,
+    "out_of_range_samples": 4,
+    "segment_count": 2,
+    "total_duration_minutes": 60.0,
+    "total_degree_minutes": 82.5,
+    "conclusion": "excursion",
+    "segments": [
+      {"start": "2026-09-01T08:30:00Z", "end": "2026-09-01T09:00:00Z",
+       "duration_minutes": 30.0, "degree_minutes": 45.0,
+       "sample_count": 2, "peak_deviation": 2.0},
+      {"start": "2026-09-01T10:00:00Z", "end": "2026-09-01T10:30:00Z",
+       "duration_minutes": 30.0, "degree_minutes": 37.5,
+       "sample_count": 2, "peak_deviation": 1.5}
+    ]
+  }
+}
+```
+
+全程合规时 `segments` 为空、各项合计为 `0.0`、结论为 `compliant`。
+评估号重复返回 `409`；收货单不存在返回 `404`；温区无效、采样点不足、
+时间未严格递增或跨度超过七天整体返回 `422` 且不留任何记录。
+
+### `GET /cold-chain-assessments/{assessment_id}`
+
+返回与创建时同一份确定性文档（原始采样 + 持久化摘要）；评估号不存在
+返回 `404`。
+
 服务启动后还提供交互式文档：`/docs`（Swagger UI）与 `/openapi.json`。
 
 ## 本地运行（Python 3.12）
@@ -232,6 +332,12 @@ pytest
   旧单仍可按规范化单号查询/扫描、阻止重复建单且原行不被改写；计划内逐码递增
   matched→excess、计划外识别并持续累计、无效码不计数且无对账结论、未知单 404；
   注入存储失败后整批 503 回滚，重试结果确定、先前已提交计数不受影响。
+- `tests/test_cold_chain.py`：全程合规得 `compliant` 且无区段；多个越界区段的
+  归并与梯形积分（持续分钟、度分钟、峰值偏差、合计恰为区段之和）及读取一致性；
+  孤立越界点的零时长区段；计算值两位小数；不同时区偏移按瞬间比较；评估号重复
+  409（含空白变体）、未知收货单 404、未知评估号 404；温区无效/采样点不足/时间
+  未严格递增/跨度超七天（恰好七天允许）/裸时区时间/非有限数值整体 422；失败
+  请求不留残记录（评估号可复用，库中无孤儿采样行）。
 
 ## Docker Compose
 
@@ -248,7 +354,9 @@ curl -s localhost:${API_PORT:-8000}/health
 `verify` 复用同一镜像，等待 `api` 健康后对**真实 HTTP 服务**执行端到端验收：
 混合批次每件独立复算校验位、核对保序与重复保留、全部非法结构必须 422 且无部分结果；
 随后建单（含重复单号 409 与非法明细 422）、分两批扫描验证 matched→excess 与
-unplanned、确认无效码不计数，并通过存储故障注入验证整批 503 回滚与确定性重试，
+unplanned、确认无效码不计数，并通过存储故障注入验证整批 503 回滚与确定性重试；
+最后登记冷链评估：全程合规结论、多个越界区段梯形积分的独立复算核对、读取与创建
+一致的确定性文档、重复评估号 409、未知收货单 404、各类非法请求 422 且不留残记录，
 然后以 0/1 退出：
 
 ```bash
@@ -263,14 +371,16 @@ docker compose run --rm verify
 app/
   __init__.py
   gtin14.py       # 14 位 ASCII 数字判定与 GTIN-14 校验位公式（无占位实现）
-  storage.py      # SQLite 收货单/明细建表、事务内按序递增、整批回滚
-  main.py         # FastAPI 应用：Pydantic 固定请求边界、对账模型与响应
+  cold_chain.py   # 冷链评估领域：越界区段归并、相邻点梯形积分、两位小数摘要
+  storage.py      # SQLite 收货单/明细与冷链评估/采样建表、事务内按序递增、整批回滚
+  main.py         # FastAPI 应用：Pydantic 固定请求边界、对账与冷链评估模型及响应
 scripts/
   acceptance.py   # 一次性验收：纯标准库访问真实服务并独立复算
 tests/
   test_gtin14.py  # 公式与单码规则
   test_api.py     # /codes/verify 接口边界、状态码与保序/重复语义
   test_receipts.py  # 建单/对账/计划外/无效码不计数/事务回滚与确定性重试
+  test_cold_chain.py  # 冷链评估：合规结论、多区段积分、读取一致、错误信封与无残记录
 Dockerfile
 docker-compose.yml
 requirements.txt

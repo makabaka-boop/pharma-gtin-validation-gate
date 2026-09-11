@@ -29,15 +29,33 @@ may still carry the padded spelling in the database; they are resolved to
 the same canonical number on every access (an exactly-canonical row wins
 when both spellings exist), so the original receipt stays valid and a
 repeated number is still rejected as a duplicate.
+
+Cold-chain quality assessments add two more tables to the same startup
+migration:
+
+* ``cold_chain_assessments`` -- one row per unique assessment number,
+  linked to its receipt order, carrying the allowed temperature zone and
+  the persisted summary (segment list as JSON).
+* ``cold_chain_samples``     -- the raw ``(recorded_at, temperature)``
+  points of one assessment, in submission order.
+
+An assessment is inserted together with all of its samples in **one
+transaction**, so a failed request (duplicate assessment number, storage
+error) leaves no partial record behind and the same number can be
+resubmitted safely.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
+
+from .cold_chain import AssessmentSummary, ExcursionSegment, SamplePoint
 
 # Default lives in the process working directory; override for tests or for
 # mounting a volume in a container.
@@ -61,6 +79,37 @@ CREATE TABLE IF NOT EXISTS receipt_items (
 
 CREATE INDEX IF NOT EXISTS idx_receipt_items_order
     ON receipt_items(order_no, line_order);
+
+CREATE TABLE IF NOT EXISTS cold_chain_assessments (
+    assessment_id        TEXT PRIMARY KEY,
+    order_no             TEXT NOT NULL,
+    min_temp             REAL NOT NULL,
+    max_temp             REAL NOT NULL,
+    sample_count         INTEGER NOT NULL,
+    span_minutes         REAL NOT NULL,
+    out_of_range_samples INTEGER NOT NULL,
+    segment_count        INTEGER NOT NULL,
+    total_duration_minutes REAL NOT NULL,
+    total_degree_minutes   REAL NOT NULL,
+    conclusion           TEXT NOT NULL,
+    segments_json        TEXT NOT NULL,  -- persisted segment list (JSON)
+    created_at           TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (order_no) REFERENCES receipts(order_no) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cold_chain_assessments_order
+    ON cold_chain_assessments(order_no);
+
+CREATE TABLE IF NOT EXISTS cold_chain_samples (
+    assessment_id TEXT NOT NULL,
+    sample_index  INTEGER NOT NULL,     -- 0-based, preserves submission order
+    recorded_at   TEXT NOT NULL,        -- ISO-8601 with timezone offset
+    temperature   REAL NOT NULL,
+    PRIMARY KEY (assessment_id, sample_index),
+    FOREIGN KEY (assessment_id)
+        REFERENCES cold_chain_assessments(assessment_id) ON DELETE CASCADE
+);
 """
 
 
@@ -74,6 +123,10 @@ class OrderNotFound(Exception):
 
 class StorageUnavailable(Exception):
     """A SQLite statement failed; the batch transaction was rolled back."""
+
+
+class AssessmentAlreadyExists(Exception):
+    """The unique cold-chain assessment number was already registered."""
 
 
 @dataclass(frozen=True)
@@ -106,6 +159,23 @@ class Reconciliation:
     conclusion: str  # "matched" | "excess" | "unplanned"
     planned_qty: int | None
     received_qty: int
+
+
+@dataclass(frozen=True)
+class ColdChainAssessmentRecord:
+    """A persisted cold-chain assessment: raw samples plus the summary.
+
+    ``order_no`` is the canonical (whitespace-stripped) business number,
+    matching what the receipts API serves, even when the linked receipt row
+    still carries a legacy padded spelling.
+    """
+
+    assessment_id: str
+    order_no: str
+    min_temp: float
+    max_temp: float
+    samples: list[SamplePoint]
+    summary: AssessmentSummary
 
 
 # A single connection is reused by the whole process. FastAPI runs sync
@@ -366,3 +436,171 @@ def record_scan_batch(
         except sqlite3.Error as error:
             raise StorageUnavailable(str(error)) from error
     return results
+
+
+# ---------------------------------------------------------------------------
+# Cold-chain assessments
+# ---------------------------------------------------------------------------
+
+
+def _canonical_assessment_id(assessment_id: str) -> str:
+    """Canonicalise an assessment number exactly like a business order no."""
+    return assessment_id.strip()
+
+
+def create_cold_chain_assessment(
+    assessment_id: str,
+    order_no: str,
+    min_temp: float,
+    max_temp: float,
+    samples: list[SamplePoint],
+    summary: AssessmentSummary,
+) -> None:
+    """Persist one assessment, its summary and all raw samples atomically.
+
+    The receipt is resolved to its stored key (legacy padded spellings
+    included) so the foreign key always references the existing row.
+    Raises :class:`OrderNotFound` if the receipt does not exist and
+    :class:`AssessmentAlreadyExists` on a duplicate assessment number; any
+    other SQLite failure becomes :class:`StorageUnavailable`. Every raise
+    happens inside the transaction, so a failed request persists nothing.
+    """
+    assessment_id = _canonical_assessment_id(assessment_id)
+    order_no = _canonical_order_no(order_no)
+    segments_payload = json.dumps(
+        [
+            {
+                "start": segment.start.isoformat(),
+                "end": segment.end.isoformat(),
+                "duration_minutes": segment.duration_minutes,
+                "degree_minutes": segment.degree_minutes,
+                "sample_count": segment.sample_count,
+                "peak_deviation": segment.peak_deviation,
+            }
+            for segment in summary.segments
+        ]
+    )
+    with _write_lock:
+        try:
+            with _transaction() as cursor:
+                stored = _resolve_stored_order_no(cursor, order_no)
+                if stored is None:
+                    # Raising inside the context manager triggers ROLLBACK.
+                    raise OrderNotFound(order_no)
+                cursor.execute(
+                    "SELECT 1 FROM cold_chain_assessments "
+                    "WHERE assessment_id = ?",
+                    (assessment_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise AssessmentAlreadyExists(assessment_id)
+                cursor.execute(
+                    "INSERT INTO cold_chain_assessments"
+                    "(assessment_id, order_no, min_temp, max_temp, "
+                    " sample_count, span_minutes, out_of_range_samples, "
+                    " segment_count, total_duration_minutes, "
+                    " total_degree_minutes, conclusion, segments_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        assessment_id,
+                        stored,
+                        min_temp,
+                        max_temp,
+                        summary.sample_count,
+                        summary.span_minutes,
+                        summary.out_of_range_samples,
+                        summary.segment_count,
+                        summary.total_duration_minutes,
+                        summary.total_degree_minutes,
+                        summary.conclusion,
+                        segments_payload,
+                    ),
+                )
+                cursor.executemany(
+                    "INSERT INTO cold_chain_samples"
+                    "(assessment_id, sample_index, recorded_at, temperature) "
+                    "VALUES (?, ?, ?, ?)",
+                    [
+                        (
+                            assessment_id,
+                            index,
+                            sample.recorded_at.isoformat(),
+                            sample.temperature,
+                        )
+                        for index, sample in enumerate(samples)
+                    ],
+                )
+        except (OrderNotFound, AssessmentAlreadyExists):
+            raise
+        except sqlite3.IntegrityError as error:
+            # Backstop: a concurrent insert won the primary-key race.
+            raise AssessmentAlreadyExists(assessment_id) from error
+        except sqlite3.Error as error:
+            raise StorageUnavailable(str(error)) from error
+
+
+def get_cold_chain_assessment(
+    assessment_id: str,
+) -> ColdChainAssessmentRecord | None:
+    """Return the persisted assessment document, or ``None`` if unknown.
+
+    The returned record is rebuilt from the stored summary and raw samples,
+    so a read always serves the same deterministic document that the
+    creating request returned.
+    """
+    assessment_id = _canonical_assessment_id(assessment_id)
+    with _write_lock:
+        try:
+            connection = _get_connection()
+            row = connection.execute(
+                "SELECT order_no, min_temp, max_temp, sample_count, "
+                "span_minutes, out_of_range_samples, segment_count, "
+                "total_duration_minutes, total_degree_minutes, conclusion, "
+                "segments_json "
+                "FROM cold_chain_assessments WHERE assessment_id = ?",
+                (assessment_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            sample_rows = connection.execute(
+                "SELECT recorded_at, temperature FROM cold_chain_samples "
+                "WHERE assessment_id = ? ORDER BY sample_index",
+                (assessment_id,),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise StorageUnavailable(str(error)) from error
+
+    segments = [
+        ExcursionSegment(
+            start=datetime.fromisoformat(segment["start"]),
+            end=datetime.fromisoformat(segment["end"]),
+            duration_minutes=segment["duration_minutes"],
+            degree_minutes=segment["degree_minutes"],
+            sample_count=segment["sample_count"],
+            peak_deviation=segment["peak_deviation"],
+        )
+        for segment in json.loads(row["segments_json"])
+    ]
+    return ColdChainAssessmentRecord(
+        assessment_id=assessment_id,
+        order_no=_canonical_order_no(row["order_no"]),
+        min_temp=row["min_temp"],
+        max_temp=row["max_temp"],
+        samples=[
+            SamplePoint(
+                recorded_at=datetime.fromisoformat(sample["recorded_at"]),
+                temperature=sample["temperature"],
+            )
+            for sample in sample_rows
+        ],
+        summary=AssessmentSummary(
+            sample_count=row["sample_count"],
+            span_minutes=row["span_minutes"],
+            out_of_range_samples=row["out_of_range_samples"],
+            segment_count=row["segment_count"],
+            total_duration_minutes=row["total_duration_minutes"],
+            total_degree_minutes=row["total_degree_minutes"],
+            conclusion=row["conclusion"],
+            segments=segments,
+        ),
+    )
