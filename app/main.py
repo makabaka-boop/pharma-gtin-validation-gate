@@ -13,7 +13,13 @@ Goods receipt (purchase-order reconciliation):
 * ``POST /receipts/{order_no}/scans`` performs the same per-code validation
   as ``/codes/verify`` and, in one SQLite transaction, books every valid
   code in input order, attaching a ``matched`` / ``excess`` / ``unplanned``
-  conclusion. Invalid codes are neither booked nor concluded.
+  conclusion. Invalid codes are neither booked nor concluded. An optional
+  ``Idempotency-Key`` header (1-128 characters, at least one non-blank)
+  makes the batch exactly-once: the canonical order number, the raw scan
+  array and the complete 200 response are stored in the same transaction as
+  the count increments, so a retry after a lost response replays the first
+  response without counting twice, a conflicting reuse of the key answers
+  409, and a rolled-back batch neither counts nor occupies its key.
 * ``GET /receipts/{order_no}`` returns the cumulative planned/received
   state used to prove rollback determinism.
 
@@ -36,7 +42,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import Body, FastAPI, Header
+from fastapi import Body, FastAPI, Header, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -56,6 +62,7 @@ from .gtin14 import STATUS_VALID, CodeResult, evaluate_code
 from .storage import (
     AssessmentAlreadyExists,
     ColdChainAssessmentRecord,
+    IdempotencyConflict,
     OrderAlreadyExists,
     PlannedLine,
     ReceiptState,
@@ -67,10 +74,14 @@ from .storage import (
     get_receipt,
     init_db,
     record_scan_batch,
+    record_scan_batch_idempotent,
 )
 
 MAX_CODES: int = 100
 MAX_LINES: int = 100
+# An Idempotency-Key is 1-128 characters with at least one non-blank
+# character; anything else fails request validation with 422.
+MAX_IDEMPOTENCY_KEY_LENGTH: int = 128
 # SQLite INTEGER is a signed 64-bit value; a planned quantity outside that
 # range cannot be persisted, so it must fail request validation (422)
 # instead of surfacing as an unhandled OverflowError (500) at insert time.
@@ -98,7 +109,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Package Code Receiving API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Receive scanned GTIN-14 package codes for pharmaceutical goods "
         "receipt and return an order-preserving, duplicate-preserving "
@@ -469,53 +480,14 @@ def create_receipt_order(payload: CreateReceiptIn) -> ReceiptCreatedOut:
     )
 
 
-@app.post(
-    "/receipts/{order_no}/scans",
-    response_model=ScanResponse,
-    tags=["receipts"],
-    summary="Scan codes against a receipt and book received quantities",
-)
-def scan_for_receipt(
-    order_no: str,
-    codes: Annotated[
-        list[str],
-        Body(
-            min_length=1,
-            max_length=MAX_CODES,
-            description="Bare JSON array of 1-100 raw package code strings.",
-        ),
-    ],
-    x_simulate_storage_failure: Annotated[str | None, Header()] = None,
-) -> ScanResponse:
-    """Validate every code and book valid ones in one SQLite transaction.
+def _build_scan_items(
+    evaluated: list[CodeResult], booked: list[Reconciliation]
+) -> list[ScanItem]:
+    """Zip per-code verdicts with booking outcomes, preserving input order.
 
-    Format errors and checksum mismatches keep their per-code verdict, are
-    not counted and carry ``reconciliation: null``. A storage failure rolls
-    back every increment of the batch and answers 503; an unknown order
-    answers 404.
+    ``booked`` has exactly one entry per *valid* code, in input order;
+    invalid codes keep their verdict and carry ``reconciliation: null``.
     """
-    # Resolve existence before evaluating codes so a wrong order number is a
-    # clean 404 even for a structurally valid body.
-    state = get_receipt(order_no)
-    if state is None:
-        return JSONResponse(  # type: ignore[return-value]
-            status_code=404,
-            content={"detail": f"unknown order_no {order_no!r}"},
-        )
-
-    evaluated: list[CodeResult] = [evaluate_code(code) for code in codes]
-    valid_gtins = [
-        result.code for result in evaluated if result.status == STATUS_VALID
-    ]
-
-    booked: list[Reconciliation] = record_scan_batch(
-        order_no,
-        valid_gtins,
-        simulate_storage_failure=_failure_injection_requested(
-            x_simulate_storage_failure
-        ),
-    )
-
     items: list[ScanItem] = []
     booked_iter = iter(booked)
     for result in evaluated:  # full per-code order preserved
@@ -535,7 +507,125 @@ def scan_for_receipt(
                 reconciliation=reconciliation,
             )
         )
-    return ScanResponse(results=items)
+    return items
+
+
+def _blank_idempotency_key_response() -> JSONResponse:
+    """422 envelope for a key that holds no non-blank character."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["header", "idempotency-key"],
+                    "msg": "Idempotency-Key must contain at least one "
+                    "non-blank character",
+                }
+            ]
+        },
+    )
+
+
+@app.post(
+    "/receipts/{order_no}/scans",
+    response_model=ScanResponse,
+    tags=["receipts"],
+    summary="Scan codes against a receipt and book received quantities",
+)
+def scan_for_receipt(
+    order_no: str,
+    codes: Annotated[
+        list[str],
+        Body(
+            min_length=1,
+            max_length=MAX_CODES,
+            description="Bare JSON array of 1-100 raw package code strings.",
+        ),
+    ],
+    x_simulate_storage_failure: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            min_length=1,
+            max_length=MAX_IDEMPOTENCY_KEY_LENGTH,
+            description="Optional idempotency batch key (1-128 characters).",
+        ),
+    ] = None,
+) -> ScanResponse:
+    """Validate every code and book valid ones in one SQLite transaction.
+
+    Format errors and checksum mismatches keep their per-code verdict, are
+    not counted and carry ``reconciliation: null``. A storage failure rolls
+    back every increment of the batch and answers 503; an unknown order
+    answers 404.
+
+    With an ``Idempotency-Key`` header the batch is booked at most once:
+    the key, the raw array and the complete response commit together with
+    the increments. Repeating the identical array with the same key replays
+    the first 200 response without counting again; reusing the key with a
+    different array answers 409 and keeps the original record. An empty,
+    blank or overlong key answers 422. Without the header every request is
+    booked as it arrives.
+    """
+    # An illegal key is a malformed request: reject it before touching any
+    # resource state, exactly like the structural body validation does.
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key:
+            return _blank_idempotency_key_response()  # type: ignore[return-value]
+
+    # Resolve existence before evaluating codes so a wrong order number is a
+    # clean 404 even for a structurally valid body.
+    state = get_receipt(order_no)
+    if state is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=404,
+            content={"detail": f"unknown order_no {order_no!r}"},
+        )
+
+    evaluated: list[CodeResult] = [evaluate_code(code) for code in codes]
+    valid_gtins = [
+        result.code for result in evaluated if result.status == STATUS_VALID
+    ]
+    simulate_failure = _failure_injection_requested(x_simulate_storage_failure)
+
+    if idempotency_key is None:
+        # No batch key: book every request as it arrives (unchanged path).
+        booked = record_scan_batch(
+            order_no,
+            valid_gtins,
+            simulate_storage_failure=simulate_failure,
+        )
+        return ScanResponse(results=_build_scan_items(evaluated, booked))
+
+    try:
+        response_json = record_scan_batch_idempotent(
+            state.order_no,
+            idempotency_key,
+            codes,
+            valid_gtins,
+            response_factory=lambda booked: ScanResponse(
+                results=_build_scan_items(evaluated, booked)
+            ).model_dump_json(),
+            simulate_storage_failure=simulate_failure,
+        )
+    except IdempotencyConflict:
+        # 409, not 422: the request itself is valid, only the key was
+        # already spent on a different array. The original record is kept.
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=409,
+            content={
+                "detail": f"Idempotency-Key {idempotency_key!r} was already "
+                f"used with a different scan batch for "
+                f"order_no {state.order_no!r}"
+            },
+        )
+    # Fresh and replayed batches return the very same stored body, so a
+    # retried request is byte-identical to the response that was lost.
+    return Response(
+        content=response_json, status_code=200, media_type="application/json"
+    )
 
 
 @app.get(

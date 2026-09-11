@@ -43,6 +43,22 @@ An assessment is inserted together with all of its samples in **one
 transaction**, so a failed request (duplicate assessment number, storage
 error) leaves no partial record behind and the same number can be
 resubmitted safely.
+
+Idempotent scan batches add one more table to the same startup migration:
+
+* ``scan_batches``        -- one row per (canonical order number,
+  ``Idempotency-Key``). The row stores the raw scan array and the complete
+  200 response body, and is inserted **in the same transaction** as the
+  count increments it records.
+
+A warehouse terminal that lost the response to a batch can resubmit it with
+the same key: an identical array replays the stored response without
+counting twice, while the same key carrying a different array is rejected
+(:class:`IdempotencyConflict`) and the original record is kept. Because the
+record commits together with the increments, a rolled-back batch neither
+counts nor occupies its key -- the same key can be retried immediately.
+Batches submitted without a key are never recorded and keep counting on
+every request.
 """
 from __future__ import annotations
 
@@ -50,7 +66,7 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -110,6 +126,16 @@ CREATE TABLE IF NOT EXISTS cold_chain_samples (
     FOREIGN KEY (assessment_id)
         REFERENCES cold_chain_assessments(assessment_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS scan_batches (
+    order_no      TEXT NOT NULL,    -- canonical (whitespace-stripped) number
+    batch_key     TEXT NOT NULL,    -- Idempotency-Key, whitespace-stripped
+    codes_json    TEXT NOT NULL,    -- raw scan array, input order preserved
+    response_json TEXT NOT NULL,    -- complete 200 response body to replay
+    created_at    TEXT NOT NULL
+                  DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (order_no, batch_key)
+);
 """
 
 
@@ -127,6 +153,14 @@ class StorageUnavailable(Exception):
 
 class AssessmentAlreadyExists(Exception):
     """The unique cold-chain assessment number was already registered."""
+
+
+class IdempotencyConflict(Exception):
+    """An Idempotency-Key was reused with a different scan array.
+
+    The first batch recorded under the key is kept untouched; nothing is
+    booked for the conflicting request.
+    """
 
 
 @dataclass(frozen=True)
@@ -355,6 +389,72 @@ def get_receipt(order_no: str) -> ReceiptState | None:
     )
 
 
+def _book_valid_gtins(
+    cursor: sqlite3.Cursor,
+    stored_order_no: str,
+    valid_gtins: list[str],
+    simulate_storage_failure: bool,
+) -> list[Reconciliation]:
+    """Increment ``received_qty`` for every valid GTIN, in input order.
+
+    Runs inside the caller's transaction (the caller commits or rolls back)
+    against the *stored* receipt key, so legacy padded rows are booked
+    correctly. When ``simulate_storage_failure`` is set, a database error is
+    raised after the first increment so the whole batch is rolled back.
+    """
+    results: list[Reconciliation] = []
+    booked = 0
+    for gtin in valid_gtins:
+        row = cursor.execute(
+            "SELECT planned_qty, received_qty FROM receipt_items "
+            "WHERE order_no = ? AND gtin = ?",
+            (stored_order_no, gtin),
+        ).fetchone()
+
+        if row is None:
+            # First sighting of a GTIN absent from the purchase
+            # plan: persist it as an unplanned line.
+            cursor.execute(
+                "INSERT INTO receipt_items"
+                "(order_no, gtin, planned_qty, received_qty, "
+                "line_order) VALUES (?, ?, NULL, 1, 0)",
+                (stored_order_no, gtin),
+            )
+            planned_qty: int | None = None
+            received = 1
+            conclusion = "unplanned"
+        else:
+            planned_qty = row["planned_qty"]
+            received = row["received_qty"] + 1
+            cursor.execute(
+                "UPDATE receipt_items SET received_qty = ? "
+                "WHERE order_no = ? AND gtin = ?",
+                (received, stored_order_no, gtin),
+            )
+            if planned_qty is None:
+                conclusion = "unplanned"
+            elif received <= planned_qty:
+                conclusion = "matched"
+            else:
+                conclusion = "excess"
+
+        results.append(
+            Reconciliation(
+                gtin=gtin,
+                conclusion=conclusion,
+                planned_qty=planned_qty,
+                received_qty=received,
+            )
+        )
+        booked += 1
+
+        if simulate_storage_failure and booked == 1:
+            raise sqlite3.DatabaseError(
+                "injected storage failure before commit"
+            )
+    return results
+
+
 def record_scan_batch(
     order_no: str,
     valid_gtins: list[str],
@@ -373,7 +473,6 @@ def record_scan_batch(
     nothing is booked, and :class:`StorageUnavailable` is raised.
     """
     order_no = _canonical_order_no(order_no)
-    results: list[Reconciliation] = []
     with _write_lock:
         try:
             with _transaction() as cursor:
@@ -381,61 +480,83 @@ def record_scan_batch(
                 if stored is None:
                     # Raising inside the context manager triggers ROLLBACK.
                     raise OrderNotFound(order_no)
-
-                booked = 0
-                for gtin in valid_gtins:
-                    row = cursor.execute(
-                        "SELECT planned_qty, received_qty FROM receipt_items "
-                        "WHERE order_no = ? AND gtin = ?",
-                        (stored, gtin),
-                    ).fetchone()
-
-                    if row is None:
-                        # First sighting of a GTIN absent from the purchase
-                        # plan: persist it as an unplanned line.
-                        cursor.execute(
-                            "INSERT INTO receipt_items"
-                            "(order_no, gtin, planned_qty, received_qty, "
-                            "line_order) VALUES (?, ?, NULL, 1, 0)",
-                            (stored, gtin),
-                        )
-                        planned_qty: int | None = None
-                        received = 1
-                        conclusion = "unplanned"
-                    else:
-                        planned_qty = row["planned_qty"]
-                        received = row["received_qty"] + 1
-                        cursor.execute(
-                            "UPDATE receipt_items SET received_qty = ? "
-                            "WHERE order_no = ? AND gtin = ?",
-                            (received, stored, gtin),
-                        )
-                        if planned_qty is None:
-                            conclusion = "unplanned"
-                        elif received <= planned_qty:
-                            conclusion = "matched"
-                        else:
-                            conclusion = "excess"
-
-                    results.append(
-                        Reconciliation(
-                            gtin=gtin,
-                            conclusion=conclusion,
-                            planned_qty=planned_qty,
-                            received_qty=received,
-                        )
-                    )
-                    booked += 1
-
-                    if simulate_storage_failure and booked == 1:
-                        raise sqlite3.DatabaseError(
-                            "injected storage failure before commit"
-                        )
+                results = _book_valid_gtins(
+                    cursor, stored, valid_gtins, simulate_storage_failure
+                )
         except OrderNotFound:
             raise
         except sqlite3.Error as error:
             raise StorageUnavailable(str(error)) from error
     return results
+
+
+def record_scan_batch_idempotent(
+    order_no: str,
+    batch_key: str,
+    raw_codes: list[str],
+    valid_gtins: list[str],
+    response_factory: Callable[[list[Reconciliation]], str],
+    simulate_storage_failure: bool = False,
+) -> str:
+    """Book one scan batch at most once under an idempotency key.
+
+    The whole operation is a single SQLite transaction (serialised by the
+    process-wide write lock), so the lookup, the count increments and the
+    batch record commit or roll back together:
+
+    * A committed record for ``(order_no, batch_key)`` carrying the
+      **identical** raw array replays its stored 200 response body verbatim;
+      nothing is counted again.
+    * The same key carrying a different array (content or order) raises
+      :class:`IdempotencyConflict`; the original record is kept and no
+      quantity changes.
+    * Otherwise the valid GTINs are booked in input order, the response
+      produced by ``response_factory`` (the complete 200 body) is stored
+      with the raw array under the canonical order number and the key, and
+      that same body is returned.
+
+    A storage failure (injected or real) rolls back the increments *and*
+    the batch record, so the key stays free for an immediate retry.
+    ``batch_key`` must already be canonicalised (whitespace-stripped) by
+    the caller; ``order_no`` is canonicalised here like everywhere else.
+    """
+    order_no = _canonical_order_no(order_no)
+    codes_json = json.dumps(raw_codes, ensure_ascii=False)
+    with _write_lock:
+        try:
+            with _transaction() as cursor:
+                row = cursor.execute(
+                    "SELECT codes_json, response_json FROM scan_batches "
+                    "WHERE order_no = ? AND batch_key = ?",
+                    (order_no, batch_key),
+                ).fetchone()
+                if row is not None:
+                    if row["codes_json"] == codes_json:
+                        # Identical batch already committed: replay the
+                        # first response without booking anything again.
+                        return row["response_json"]
+                    # Same key, different array: keep the original record.
+                    raise IdempotencyConflict(batch_key)
+
+                stored = _resolve_stored_order_no(cursor, order_no)
+                if stored is None:
+                    # Raising inside the context manager triggers ROLLBACK.
+                    raise OrderNotFound(order_no)
+                booked = _book_valid_gtins(
+                    cursor, stored, valid_gtins, simulate_storage_failure
+                )
+                response_json = response_factory(booked)
+                cursor.execute(
+                    "INSERT INTO scan_batches"
+                    "(order_no, batch_key, codes_json, response_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (order_no, batch_key, codes_json, response_json),
+                )
+                return response_json
+        except (OrderNotFound, IdempotencyConflict):
+            raise
+        except sqlite3.Error as error:
+            raise StorageUnavailable(str(error)) from error
 
 
 # ---------------------------------------------------------------------------

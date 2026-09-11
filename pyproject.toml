@@ -1,7 +1,7 @@
 [project]
 name = "package-code-receiving"
-version = "1.2.0"
-description = "FastAPI backend that verifies scanned GTIN-14 package codes for pharmaceutical goods receipt, reconciles receipts against purchase orders and assesses cold-chain temperature records"
+version = "1.3.0"
+description = "FastAPI backend that verifies scanned GTIN-14 package codes for pharmaceutical goods receipt, reconciles receipts against purchase orders with idempotent scan batches and assesses cold-chain temperature records"
 requires-python = ">=3.12"
 readme = "README.md"
 

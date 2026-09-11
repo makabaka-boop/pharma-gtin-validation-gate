@@ -16,7 +16,13 @@ It audits both feature areas:
    unplanned GTINs, never book malformed/checksum-bad codes, return 404 for
    unknown orders, and roll back the whole batch on storage failure so a
    retry produces exactly the same counts as if the failure never happened.
-3. Cold-chain assessment -- register a temperature record for a completed
+3. Idempotent scan batches -- an ``Idempotency-Key`` header makes a batch
+   exactly-once: a retry after a lost response replays the first 200 body
+   without recounting, reusing the key with a different array answers 409
+   and keeps the original record, illegal keys answer 422, a rolled-back
+   batch frees its key for an immediate retry, and keyless batches keep
+   accumulating on every request.
+4. Cold-chain assessment -- register a temperature record for a completed
    receipt (201), verify the trapezoidal integration of multiple excursion
    segments against an independent recomputation, confirm the persisted
    document is served identically on read, and prove the error contract:
@@ -437,6 +443,141 @@ def audit_rollback_and_deterministic_retry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Idempotent scan-batch audits (Idempotency-Key)
+# ---------------------------------------------------------------------------
+
+
+def audit_scan_idempotency() -> None:
+    print()
+    print("== idempotency: replay after a lost response never recounts ==")
+    suffix = int(time.time())
+    order_no = f"ACC-IDEM-{suffix}"
+    status_code, _ = _create_order(order_no, [[GTIN_A, 2]])
+    check(status_code == 201,
+          f"idempotency order created: HTTP 201 (got {status_code})")
+
+    def keyed_scan(
+        codes: list, key: str, extra: dict[str, str] | None = None
+    ) -> tuple[int, object]:
+        headers = {"Idempotency-Key": key}
+        if extra:
+            headers.update(extra)
+        return _scan(order_no, codes, headers=headers)
+
+    batch = [GTIN_A, GTIN_BAD_CHECKSUM, GTIN_A]
+    key = f"batch-{suffix}"
+    status_code, first = keyed_scan(batch, key)
+    check(status_code == 200,
+          f"keyed batch: HTTP 200 (got {status_code})")
+    if status_code == 200:
+        check(_summary(first["results"]) == [
+            ("valid", "matched", 2, 1),
+            None,  # checksum mismatch: not booked
+            ("valid", "matched", 2, 2),
+        ], "keyed batch books like a keyless one: matched/null/matched")
+
+    # The terminal lost the response and retries the identical batch: the
+    # first 200 body comes back and the goods are not counted twice.
+    status_code, replay = keyed_scan(batch, key)
+    check(status_code == 200 and replay == first,
+          "identical retry replays the first 200 response exactly")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 2},
+          "replay did not count the batch a second time (A stays 2)")
+
+    print()
+    print("== idempotency: conflicting key reuse is 409 and keeps the record ==")
+    status_code, body = keyed_scan([GTIN_A], key)
+    check(status_code == 409,
+          f"same key, different content: HTTP 409 (got {status_code})")
+    check(isinstance(body, dict) and "detail" in body
+          and "results" not in body,
+          "409 carries the error envelope and no partial results")
+    status_code, _ = keyed_scan([GTIN_A, GTIN_A, GTIN_BAD_CHECKSUM], key)
+    check(status_code == 409,
+          f"same key, reordered array: HTTP 409 (got {status_code})")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 2},
+          "conflicting reuse changed no counts (A stays 2)")
+    status_code, replay = keyed_scan(batch, key)
+    check(status_code == 200 and replay == first,
+          "original record kept: the first batch still replays")
+
+    print()
+    print("== idempotency: illegal keys are 422, boundaries hold ==")
+    for label, bad_key in (
+        ("empty key", ""),
+        ("whitespace-only key", "   "),
+        ("129-character key", "k" * 129),
+    ):
+        status_code, body = keyed_scan(batch, bad_key)
+        check(status_code == 422,
+              f"{label}: HTTP 422 (got {status_code})")
+        check(isinstance(body, dict) and "results" not in body,
+              f"{label}: no partial 'results'")
+    status_code, _ = keyed_scan([GTIN_A], "k" * 128)
+    check(status_code == 200,
+          f"128-character key accepted: HTTP 200 (got {status_code})")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 3},
+          "only the valid keyed request counted (A is 3)")
+
+    print()
+    print("== idempotency: a rolled-back batch frees its key for retry ==")
+    fail_key = f"batch-fail-{suffix}"
+    status_code, body = keyed_scan([GTIN_A, GTIN_A], fail_key,
+                                   extra=FAILURE_HEADER)
+    check(status_code == 503,
+          f"storage failure on keyed batch: HTTP 503 (got {status_code})")
+    check(isinstance(body, dict) and "results" not in body,
+          "503 returns no partial results")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 3},
+          "rolled-back keyed batch left counts untouched (A stays 3)")
+
+    # The failed attempt occupied nothing: the same key accepts the retry
+    # and books it exactly once; a later identical retry replays it.
+    status_code, retried = keyed_scan([GTIN_A, GTIN_A], fail_key)
+    check(status_code == 200,
+          f"same key retried after failure: HTTP 200 (got {status_code})")
+    if status_code == 200:
+        check(_summary(retried["results"]) == [
+            ("valid", "excess", 2, 4),
+            ("valid", "excess", 2, 5),
+        ], "retry books exactly once: received 4/5")
+    status_code, replay = keyed_scan([GTIN_A, GTIN_A], fail_key)
+    check(status_code == 200 and replay == retried,
+          "retried batch replays identically afterwards")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 5},
+          "no double counting across failure and replay (A is 5)")
+
+    print()
+    print("== idempotency: keyless batches and key scoping ==")
+    status_code, plain_one = _scan(order_no, [GTIN_A])
+    status_code, plain_two = _scan(order_no, [GTIN_A])
+    check(status_code == 200 and plain_two != plain_one,
+          "two identical keyless batches are both booked")
+    _, state = get_json(f"{RECEIPTS_URL}/{order_no}")
+    check(_received_map(state) == {GTIN_A: 7},
+          "keyless scans keep accumulating (A is 7)")
+
+    other_order = f"ACC-IDEM2-{suffix}"
+    status_code, _ = _create_order(other_order, [[GTIN_A, 1]])
+    check(status_code == 201, "second order created for key scoping")
+    status_code, body = _scan(other_order, [GTIN_A],
+                              headers={"Idempotency-Key": key})
+    check(status_code == 200
+          and _summary(body["results"]) == [("valid", "matched", 1, 1)],
+          "the same key on a different order is an independent batch")
+
+    status_code, _ = _scan("NO-SUCH-ORDER", [GTIN_A],
+                           headers={"Idempotency-Key": key})
+    check(status_code == 404,
+          f"keyed scan on unknown order: HTTP 404 (got {status_code})")
+
+
+# ---------------------------------------------------------------------------
 # Cold-chain assessment audits
 # ---------------------------------------------------------------------------
 
@@ -712,6 +853,7 @@ def main() -> int:
     audit_rejections()
     audit_receipt_lifecycle()
     audit_rollback_and_deterministic_retry()
+    audit_scan_idempotency()
     audit_cold_chain_assessments()
 
     print()
@@ -721,10 +863,12 @@ def main() -> int:
     print("ACCEPTANCE PASSED: per-code verdicts are order-preserving and")
     print("recomputable; planned receipts increment to matched/excess, unplanned")
     print("goods are identified, invalid codes never book, and rolled-back")
-    print("batches retry with deterministic counts. Cold-chain assessments")
-    print("merge excursions into segments with exact trapezoidal integrals,")
-    print("serve identical documents on read, and keep no residue after")
-    print("rejected requests.")
+    print("batches retry with deterministic counts. Idempotency-Key batches")
+    print("replay the first response after a lost response, reject conflicting")
+    print("reuse with 409, and free their key after a rollback, while keyless")
+    print("scans keep accumulating. Cold-chain assessments merge excursions")
+    print("into segments with exact trapezoidal integrals, serve identical")
+    print("documents on read, and keep no residue after rejected requests.")
     return 0
 
 
