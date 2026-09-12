@@ -33,7 +33,8 @@ It audits both feature areas:
    then submit a review and verify the three dispositions
    (``expired`` / ``short_dated`` / ``usable``) and the per-GTIN sort
    against an independent recomputation, confirm unplanned merchandise can
-   be reviewed, prove an over-declared submission leaves no residual
+   be reviewed while unbooked GTINs (absent, or planned but never scanned)
+   answer 404, prove an over-declared submission leaves no residual
    record, and read the created document back identically.
 
 Usage (from the repository root):
@@ -60,7 +61,8 @@ HEALTH_URL = f"{API_BASE}/health"
 GTIN_A = "07300040109316"   # valid, check digit 6
 GTIN_B = "00000000000000"   # valid, check digit 0
 GTIN_C = "00000000000017"   # valid, check digit 7 (unplanned in audits)
-GTIN_D = "12345678901231"   # valid, check digit 1 (never booked in audits)
+GTIN_D = "12345678901231"   # valid, check digit 1 (planned, never scanned)
+GTIN_E = "00000000000031"   # valid, check digit 1 (never on any order)
 GTIN_BAD_CHECKSUM = "07300040109310"  # 14 digits, check digit should be 6
 GTIN_MALFORMED = "0730004010-9316"    # hyphen: format error, never converted
 
@@ -874,12 +876,15 @@ def audit_shelf_life_reviews() -> None:
     print("== shelf-life review: three dispositions, stable sort, read-back ==")
     suffix = int(time.time())
     order_no = f"ACC-SL-{suffix}"
-    status_code, _ = _create_order(order_no, [[GTIN_A, 10], [GTIN_B, 3]])
+    status_code, _ = _create_order(
+        order_no, [[GTIN_A, 10], [GTIN_B, 3], [GTIN_D, 5]]
+    )
     check(status_code == 201,
           f"review receipt created: HTTP 201 (got {status_code})")
 
-    # Book goods: A fills its plan of 10, B receives 2 of its 3 planned,
-    # and C arrives unplanned (booked without a purchase-plan line).
+    # Book goods: A fills its plan of 10, B receives 2 of its 3 planned, C
+    # arrives unplanned (booked without a purchase-plan line), and D stays
+    # planned but entirely unscanned -- not yet booked merchandise.
     status_code, _ = _scan(
         order_no, [GTIN_A] * 10 + [GTIN_B, GTIN_B, GTIN_C, GTIN_C]
     )
@@ -996,11 +1001,22 @@ def audit_shelf_life_reviews() -> None:
     status_code, _ = request_json(
         SHELF_LIFE_URL,
         {**review_body, "review_id": f"ACC-SLR404G-{suffix}",
+         "items": [{"gtin": GTIN_E,
+                    "batches": [batch("E-1", 1, date(2027, 1, 1))]}]},
+    )
+    check(status_code == 404,
+          f"GTIN absent from the receipt: HTTP 404 (got {status_code})")
+
+    # D is on the purchase plan but nothing was ever scanned in: planned
+    # yet unbooked merchandise is a 404, not a reviewable GTIN.
+    status_code, _ = request_json(
+        SHELF_LIFE_URL,
+        {**review_body, "review_id": f"ACC-SLR404P-{suffix}",
          "items": [{"gtin": GTIN_D,
                     "batches": [batch("D-1", 1, date(2027, 1, 1))]}]},
     )
     check(status_code == 404,
-          f"GTIN never booked on the receipt: HTTP 404 (got {status_code})")
+          f"planned but not yet scanned GTIN: HTTP 404 (got {status_code})")
 
     status_code, _ = get_json(f"{SHELF_LIFE_URL}/NO-SUCH-REVIEW")
     check(status_code == 404, "read unknown review: HTTP 404")

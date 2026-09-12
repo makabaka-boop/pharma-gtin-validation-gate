@@ -939,9 +939,10 @@ def create_review(payload: CreateShelfLifeReviewIn) -> ShelfLifeReviewOut:
     """Review the booked batches of one receipt and mark their dispositions.
 
     The receipt must exist and every submitted GTIN must already be booked
-    on it -- planned lines and unplanned-but-booked merchandise alike
-    (404 otherwise). The declared batch quantities of one GTIN must not
-    total more than its received quantity; an illegal date, a repeated
+    on it -- a planned line counts only once at least one unit was scanned
+    in, and unplanned-but-booked merchandise qualifies as well (404
+    otherwise). The declared batch quantities of one GTIN must not total
+    more than its received quantity; an illegal date, a repeated
     batch number, a non-positive quantity, a threshold outside 0-3650 days
     or an over-declared total fails validation as a whole with 422. A
     repeated review number answers 409. Failed requests persist nothing.
@@ -961,7 +962,11 @@ def create_review(payload: CreateShelfLifeReviewIn) -> ShelfLifeReviewOut:
     review_items: list[ShelfLifeReviewItem] = []
     for index, item in enumerate(payload.items):
         received_qty = received_by_gtin.get(item.gtin)
-        if received_qty is None:
+        if received_qty is None or received_qty == 0:
+            # Absent from the receipt, or planned but nothing scanned yet:
+            # either way the merchandise is not booked and cannot be
+            # reviewed (a planned line only becomes booked goods once its
+            # first unit is scanned in).
             return JSONResponse(  # type: ignore[return-value]
                 status_code=404,
                 content={

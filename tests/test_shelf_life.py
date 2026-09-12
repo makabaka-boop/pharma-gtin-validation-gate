@@ -310,13 +310,17 @@ def test_unbooked_gtin_is_404(client: TestClient) -> None:
     assert "detail" in response.json()
 
 
-def test_planned_but_unreceived_gtin_is_422_not_404(client: TestClient) -> None:
+def test_planned_but_unreceived_gtin_is_404(client: TestClient) -> None:
     _create(client)  # GTIN_B is planned (3) but never scanned
     _scan(client, "PO-SL", [GTIN_A])
     items = [{"gtin": GTIN_B, "batches": [_batch("B1", 1, "2027-01-01")]}]
-    # The GTIN is on the books, but declared 1 exceeds received 0.
+    # Planned but nothing scanned in yet: the merchandise is not booked.
     response = _review(client, items=items)
-    assert response.status_code == 422
+    assert response.status_code == 404
+    assert "detail" in response.json()
+    # Once the first unit is scanned, the same GTIN becomes reviewable.
+    _scan(client, "PO-SL", [GTIN_B])
+    assert _review(client, items=items).status_code == 201
 
 
 def test_get_unknown_review_is_404(client: TestClient) -> None:
@@ -473,6 +477,9 @@ def test_failed_requests_leave_no_residual_records(client: TestClient) -> None:
             _batch("B1", 1, "2027-01-01")]}]),
         # unknown receipt
         body("SLR-F7", order_no="PO-GONE"),
+        # planned on the receipt but nothing scanned in yet
+        body("SLR-F8", items=[{"gtin": GTIN_B, "batches": [
+            _batch("B1", 1, "2027-01-01")]}]),
     ]
     for failing in failing_bodies:
         response = client.post("/shelf-life-reviews", json=failing)
