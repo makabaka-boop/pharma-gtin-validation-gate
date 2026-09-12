@@ -33,13 +33,26 @@ Cold-chain quality assessment:
   temperature-control conclusion (persisted with the raw samples).
 * ``GET /cold-chain-assessments/{assessment_id}`` returns the same
   deterministic document; an unknown assessment answers 404.
+
+Shelf-life review (货架期复核):
+
+* ``POST /shelf-life-reviews`` registers one shelf-life review for an
+  existing receipt: a unique review number, the review date, the minimum
+  sellable-days threshold and the declared batches (batch number, quantity,
+  expiry date) of every booked GTIN. Remaining days are counted in calendar
+  days; batches below zero, below the threshold and at or above it are
+  marked ``expired`` / ``short_dated`` / ``usable`` and stably sorted by
+  expiry date and batch number within each GTIN. The review, its GTIN items
+  and the batch details are persisted atomically.
+* ``GET /shelf-life-reviews/{review_id}`` returns the same deterministic
+  document; an unknown review number answers 404.
 """
 from __future__ import annotations
 
 import math
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from fastapi import Body, FastAPI, Header, Response
@@ -59,6 +72,14 @@ from .cold_chain import (
     assess_cold_chain,
 )
 from .gtin14 import STATUS_VALID, CodeResult, evaluate_code
+from .shelf_life import (
+    DISPOSITION_EXPIRED,
+    DISPOSITION_SHORT_DATED,
+    DISPOSITION_USABLE,
+    MAX_MIN_SELLABLE_DAYS,
+    DeclaredBatch,
+    review_batches,
+)
 from .storage import (
     AssessmentAlreadyExists,
     ColdChainAssessmentRecord,
@@ -67,11 +88,16 @@ from .storage import (
     PlannedLine,
     ReceiptState,
     Reconciliation,
+    ReviewAlreadyExists,
+    ShelfLifeReviewItem,
+    ShelfLifeReviewRecord,
     StorageUnavailable,
     create_cold_chain_assessment,
     create_receipt,
+    create_shelf_life_review,
     get_cold_chain_assessment,
     get_receipt,
+    get_shelf_life_review,
     init_db,
     record_scan_batch,
     record_scan_batch_idempotent,
@@ -90,6 +116,8 @@ MAX_PLANNED_QTY: int = 2**63 - 1
 Status = Literal["valid", "format_error", "checksum_mismatch"]
 Conclusion = Literal["matched", "excess", "unplanned"]
 ColdChainConclusion = Literal["compliant", "excursion"]
+Disposition = Literal["expired", "short_dated", "usable"]
+Disposition = Literal["expired", "short_dated", "usable"]
 
 # The storage-failure test seam is inert unless explicitly enabled, so a
 # stray header in production can never destroy a batch. The acceptance
@@ -109,13 +137,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Package Code Receiving API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Receive scanned GTIN-14 package codes for pharmaceutical goods "
         "receipt and return an order-preserving, duplicate-preserving "
         "verdict for each code, with purchase-order reconciliation for "
-        "created receipt orders and cold-chain temperature assessment for "
-        "completed receipts."
+        "created receipt orders, cold-chain temperature assessment for "
+        "completed receipts and shelf-life reviews for booked goods."
     ),
     lifespan=lifespan,
 )
@@ -349,6 +377,111 @@ class ColdChainAssessmentOut(BaseModel):
     summary: ColdChainSummaryOut
 
 
+# ---------------------------------------------------------------------------
+# Shelf-life review models
+# ---------------------------------------------------------------------------
+
+
+class ShelfLifeBatchIn(BaseModel):
+    """One declared batch: production batch number, quantity, expiry date."""
+
+    batch_no: Annotated[str, Field(min_length=1, max_length=128)]
+    quantity: Annotated[StrictInt, Field(gt=0, le=MAX_PLANNED_QTY)]
+    expiry_date: date
+
+
+class ShelfLifeItemIn(BaseModel):
+    """All batches declared for one GTIN already booked on the receipt."""
+
+    gtin: Annotated[str, Field(min_length=1, max_length=128)]
+    batches: Annotated[
+        list[ShelfLifeBatchIn], Field(min_length=1, max_length=MAX_LINES)
+    ]
+
+
+class CreateShelfLifeReviewIn(BaseModel):
+    """Body for ``POST /shelf-life-reviews``."""
+
+    review_id: Annotated[str, Field(min_length=1, max_length=128)]
+    order_no: Annotated[str, Field(min_length=1, max_length=128)]
+    review_date: date
+    min_sellable_days: Annotated[
+        StrictInt, Field(ge=0, le=MAX_MIN_SELLABLE_DAYS)
+    ]
+    items: Annotated[
+        list[ShelfLifeItemIn], Field(min_length=1, max_length=MAX_LINES)
+    ]
+
+    @model_validator(mode="after")
+    def validate_business_rules(self) -> CreateShelfLifeReviewIn:
+        if not self.review_id.strip():
+            raise ValueError(
+                "review_id must contain at least one non-blank char"
+            )
+        if "/" in self.review_id:
+            # Like order_no, the review number is addressed as a single
+            # URL path segment; a slash would make it unreachable.
+            raise ValueError("review_id must not contain '/'")
+        gtins = [item.gtin for item in self.items]
+        if len(set(gtins)) != len(gtins):
+            raise ValueError("items must not contain duplicate GTINs")
+        for item in self.items:
+            batch_nos: list[str] = []
+            for batch in item.batches:
+                if not batch.batch_no.strip():
+                    raise ValueError(
+                        "batch_no must contain at least one non-blank char"
+                    )
+                batch_nos.append(batch.batch_no)
+            if len(set(batch_nos)) != len(batch_nos):
+                raise ValueError(
+                    f"batches of GTIN {item.gtin!r} must not contain "
+                    "duplicate batch numbers"
+                )
+        return self
+
+
+class ShelfLifeBatchOut(BaseModel):
+    """One reviewed batch with its remaining days and disposition."""
+
+    batch_no: str
+    quantity: int
+    expiry_date: date
+    remaining_days: int
+    disposition: Disposition
+
+
+class ShelfLifeItemOut(BaseModel):
+    """One reviewed GTIN: booked snapshot plus its sorted batches."""
+
+    gtin: str
+    received_qty: int
+    declared_qty: int
+    batches: list[ShelfLifeBatchOut]
+
+
+class ShelfLifeSummaryOut(BaseModel):
+    """Disposition counts over the whole review."""
+
+    gtin_count: int
+    batch_count: int
+    declared_qty: int
+    expired_batches: int
+    short_dated_batches: int
+    usable_batches: int
+
+
+class ShelfLifeReviewOut(BaseModel):
+    """Full review document: header, sorted items and the summary."""
+
+    review_id: str
+    order_no: str
+    review_date: date
+    min_sellable_days: int
+    items: list[ShelfLifeItemOut]
+    summary: ShelfLifeSummaryOut
+
+
 def _line_out(line: PlannedLine) -> PlannedLineOut:
     return PlannedLineOut(
         gtin=line.gtin,
@@ -401,6 +534,56 @@ def _assessment_out(record: ColdChainAssessmentRecord) -> ColdChainAssessmentOut
             for sample in record.samples
         ],
         summary=_summary_out(record.summary),
+    )
+
+
+def _review_out(record: ShelfLifeReviewRecord) -> ShelfLifeReviewOut:
+    items: list[ShelfLifeItemOut] = []
+    for item in record.items:
+        items.append(
+            ShelfLifeItemOut(
+                gtin=item.gtin,
+                received_qty=item.received_qty,
+                declared_qty=sum(batch.quantity for batch in item.batches),
+                batches=[
+                    ShelfLifeBatchOut(
+                        batch_no=batch.batch_no,
+                        quantity=batch.quantity,
+                        expiry_date=batch.expiry_date,
+                        remaining_days=batch.remaining_days,
+                        disposition=batch.disposition,  # type: ignore[arg-type]
+                    )
+                    for batch in item.batches
+                ],
+            )
+        )
+    all_batches = [batch for item in record.items for batch in item.batches]
+    return ShelfLifeReviewOut(
+        review_id=record.review_id,
+        order_no=record.order_no,
+        review_date=record.review_date,
+        min_sellable_days=record.min_sellable_days,
+        items=items,
+        summary=ShelfLifeSummaryOut(
+            gtin_count=len(record.items),
+            batch_count=len(all_batches),
+            declared_qty=sum(batch.quantity for batch in all_batches),
+            expired_batches=sum(
+                1
+                for batch in all_batches
+                if batch.disposition == DISPOSITION_EXPIRED
+            ),
+            short_dated_batches=sum(
+                1
+                for batch in all_batches
+                if batch.disposition == DISPOSITION_SHORT_DATED
+            ),
+            usable_batches=sum(
+                1
+                for batch in all_batches
+                if batch.disposition == DISPOSITION_USABLE
+            ),
+        ),
     )
 
 
@@ -718,3 +901,130 @@ def read_assessment(assessment_id: str) -> ColdChainAssessmentOut:
             content={"detail": f"unknown assessment_id {assessment_id!r}"},
         )
     return _assessment_out(record)
+
+
+# ---------------------------------------------------------------------------
+# Shelf-life review endpoints
+# ---------------------------------------------------------------------------
+
+
+def _over_declared_response(
+    index: int, gtin: str, declared_qty: int, received_qty: int
+) -> JSONResponse:
+    """422 envelope for a declared batch total above the booked quantity."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body", "items", index, "batches"],
+                    "msg": f"declared batch quantities total {declared_qty}, "
+                    f"exceeding the received quantity {received_qty} "
+                    f"of GTIN {gtin!r}",
+                }
+            ]
+        },
+    )
+
+
+@app.post(
+    "/shelf-life-reviews",
+    response_model=ShelfLifeReviewOut,
+    status_code=201,
+    tags=["shelf-life"],
+    summary="Review booked batches and produce the shelf-life disposition list",
+)
+def create_review(payload: CreateShelfLifeReviewIn) -> ShelfLifeReviewOut:
+    """Review the booked batches of one receipt and mark their dispositions.
+
+    The receipt must exist and every submitted GTIN must already be booked
+    on it -- planned lines and unplanned-but-booked merchandise alike
+    (404 otherwise). The declared batch quantities of one GTIN must not
+    total more than its received quantity; an illegal date, a repeated
+    batch number, a non-positive quantity, a threshold outside 0-3650 days
+    or an over-declared total fails validation as a whole with 422. A
+    repeated review number answers 409. Failed requests persist nothing.
+    On success the review, its items and the batch details are stored
+    atomically and the disposition list is returned.
+    """
+    # Resolve the receipt before computing anything so a wrong order number
+    # is a clean 404 even for a structurally valid body.
+    state = get_receipt(payload.order_no)
+    if state is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=404,
+            content={"detail": f"unknown order_no {payload.order_no!r}"},
+        )
+
+    received_by_gtin = {line.gtin: line.received_qty for line in state.items}
+    review_items: list[ShelfLifeReviewItem] = []
+    for index, item in enumerate(payload.items):
+        received_qty = received_by_gtin.get(item.gtin)
+        if received_qty is None:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404,
+                content={
+                    "detail": f"GTIN {item.gtin!r} is not booked on "
+                    f"order {state.order_no!r}"
+                },
+            )
+        declared_qty = sum(batch.quantity for batch in item.batches)
+        if declared_qty > received_qty:
+            return _over_declared_response(  # type: ignore[return-value]
+                index, item.gtin, declared_qty, received_qty
+            )
+        review_items.append(
+            ShelfLifeReviewItem(
+                gtin=item.gtin,
+                received_qty=received_qty,
+                batches=review_batches(
+                    [
+                        DeclaredBatch(
+                            batch_no=batch.batch_no,
+                            quantity=batch.quantity,
+                            expiry_date=batch.expiry_date,
+                        )
+                        for batch in item.batches
+                    ],
+                    payload.review_date,
+                    payload.min_sellable_days,
+                ),
+            )
+        )
+
+    review_id = payload.review_id.strip()
+    try:
+        create_shelf_life_review(
+            review_id,
+            state.order_no,
+            payload.review_date,
+            payload.min_sellable_days,
+            review_items,
+        )
+    except ReviewAlreadyExists:
+        # 409, not 422: the body itself is valid, only the number repeats.
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=409,
+            content={"detail": f"review_id {review_id!r} already exists"},
+        )
+    record = get_shelf_life_review(review_id)
+    assert record is not None  # just created above
+    return _review_out(record)
+
+
+@app.get(
+    "/shelf-life-reviews/{review_id}",
+    response_model=ShelfLifeReviewOut,
+    tags=["shelf-life"],
+    summary="Read the deterministic document of a shelf-life review",
+)
+def read_review(review_id: str) -> ShelfLifeReviewOut:
+    """Return the persisted review (404 if the number is unknown)."""
+    record = get_shelf_life_review(review_id)
+    if record is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=404,
+            content={"detail": f"unknown review_id {review_id!r}"},
+        )
+    return _review_out(record)

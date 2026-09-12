@@ -63,6 +63,23 @@ record commits together with the increments, a rolled-back batch neither
 counts nor occupies its key -- the same key can be retried immediately.
 Batches submitted without a key are never recorded and keep counting on
 every request.
+
+Shelf-life reviews add three more tables to the same startup migration:
+
+* ``shelf_life_reviews``      -- one row per unique review number, linked to
+  its receipt order, carrying the review date and the minimum sellable-days
+  threshold.
+* ``shelf_life_review_items`` -- one row per reviewed GTIN, snapshotting the
+  booked (received) quantity at review time so the served document stays
+  frozen even when later scans keep counting.
+* ``shelf_life_batches``      -- one row per declared batch: quantity,
+  expiry date, the computed remaining days and disposition, and its sorted
+  position within the GTIN.
+
+A review is inserted together with all of its items and batches in **one
+transaction**, so a failed request (duplicate review number, storage error)
+leaves no partial record behind and the same number can be resubmitted
+safely.
 """
 from __future__ import annotations
 
@@ -73,9 +90,10 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from .cold_chain import AssessmentSummary, ExcursionSegment, SamplePoint
+from .shelf_life import ReviewedBatch
 
 # Default lives in the process working directory; override for tests or for
 # mounting a volume in a container.
@@ -146,6 +164,43 @@ CREATE TABLE IF NOT EXISTS scan_batches (
                   DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (order_no, batch_key)
 );
+
+CREATE TABLE IF NOT EXISTS shelf_life_reviews (
+    review_id         TEXT PRIMARY KEY,
+    order_no          TEXT NOT NULL,
+    review_date       TEXT NOT NULL,        -- ISO-8601 calendar date
+    min_sellable_days INTEGER NOT NULL,
+    created_at        TEXT NOT NULL
+                      DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (order_no) REFERENCES receipts(order_no) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_shelf_life_reviews_order
+    ON shelf_life_reviews(order_no);
+
+CREATE TABLE IF NOT EXISTS shelf_life_review_items (
+    review_id    TEXT NOT NULL,
+    gtin         TEXT NOT NULL,
+    received_qty INTEGER NOT NULL,  -- booked quantity snapshot at review time
+    item_order   INTEGER NOT NULL,  -- 0-based, preserves GTIN submission order
+    PRIMARY KEY (review_id, gtin),
+    FOREIGN KEY (review_id)
+        REFERENCES shelf_life_reviews(review_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS shelf_life_batches (
+    review_id      TEXT NOT NULL,
+    gtin           TEXT NOT NULL,
+    batch_no       TEXT NOT NULL,
+    quantity       INTEGER NOT NULL,
+    expiry_date    TEXT NOT NULL,   -- ISO-8601 calendar date
+    remaining_days INTEGER NOT NULL,
+    disposition    TEXT NOT NULL,   -- expired | short_dated | usable
+    batch_order    INTEGER NOT NULL,  -- 0-based sorted position within the GTIN
+    PRIMARY KEY (review_id, gtin, batch_no),
+    FOREIGN KEY (review_id)
+        REFERENCES shelf_life_reviews(review_id) ON DELETE CASCADE
+);
 """
 
 
@@ -171,6 +226,10 @@ class IdempotencyConflict(Exception):
     The first batch recorded under the key is kept untouched; nothing is
     booked for the conflicting request.
     """
+
+
+class ReviewAlreadyExists(Exception):
+    """The unique shelf-life review number was already registered."""
 
 
 @dataclass(frozen=True)
@@ -220,6 +279,31 @@ class ColdChainAssessmentRecord:
     max_temp: float
     samples: list[SamplePoint]
     summary: AssessmentSummary
+
+
+@dataclass(frozen=True)
+class ShelfLifeReviewItem:
+    """One reviewed GTIN: the booked-quantity snapshot and its sorted batches."""
+
+    gtin: str
+    received_qty: int
+    batches: list[ReviewedBatch]
+
+
+@dataclass(frozen=True)
+class ShelfLifeReviewRecord:
+    """A persisted shelf-life review: header plus every reviewed GTIN.
+
+    ``order_no`` is the canonical (whitespace-stripped) business number,
+    matching what the receipts API serves, even when the linked receipt row
+    still carries a legacy padded spelling.
+    """
+
+    review_id: str
+    order_no: str
+    review_date: date
+    min_sellable_days: int
+    items: list[ShelfLifeReviewItem]
 
 
 # A single connection is reused by the whole process. FastAPI runs sync
@@ -753,4 +837,155 @@ def get_cold_chain_assessment(
             conclusion=row["conclusion"],
             segments=segments,
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shelf-life reviews
+# ---------------------------------------------------------------------------
+
+
+def _canonical_review_id(review_id: str) -> str:
+    """Canonicalise a review number exactly like a business order no."""
+    return review_id.strip()
+
+
+def create_shelf_life_review(
+    review_id: str,
+    order_no: str,
+    review_date: date,
+    min_sellable_days: int,
+    items: list[ShelfLifeReviewItem],
+) -> None:
+    """Persist one review, its GTIN items and all batch rows atomically.
+
+    The receipt is resolved to its stored key (legacy padded spellings
+    included) so the foreign key always references the existing row.
+    Raises :class:`OrderNotFound` if the receipt does not exist and
+    :class:`ReviewAlreadyExists` on a duplicate review number; any other
+    SQLite failure becomes :class:`StorageUnavailable`. Every raise happens
+    inside the transaction, so a failed request persists nothing.
+    """
+    review_id = _canonical_review_id(review_id)
+    order_no = _canonical_order_no(order_no)
+    with _write_lock:
+        try:
+            with _transaction() as cursor:
+                stored = _resolve_stored_order_no(cursor, order_no)
+                if stored is None:
+                    # Raising inside the context manager triggers ROLLBACK.
+                    raise OrderNotFound(order_no)
+                cursor.execute(
+                    "SELECT 1 FROM shelf_life_reviews WHERE review_id = ?",
+                    (review_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise ReviewAlreadyExists(review_id)
+                cursor.execute(
+                    "INSERT INTO shelf_life_reviews"
+                    "(review_id, order_no, review_date, min_sellable_days) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        review_id,
+                        stored,
+                        review_date.isoformat(),
+                        min_sellable_days,
+                    ),
+                )
+                cursor.executemany(
+                    "INSERT INTO shelf_life_review_items"
+                    "(review_id, gtin, received_qty, item_order) "
+                    "VALUES (?, ?, ?, ?)",
+                    [
+                        (review_id, item.gtin, item.received_qty, index)
+                        for index, item in enumerate(items)
+                    ],
+                )
+                cursor.executemany(
+                    "INSERT INTO shelf_life_batches"
+                    "(review_id, gtin, batch_no, quantity, expiry_date, "
+                    " remaining_days, disposition, batch_order) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            review_id,
+                            item.gtin,
+                            batch.batch_no,
+                            batch.quantity,
+                            batch.expiry_date.isoformat(),
+                            batch.remaining_days,
+                            batch.disposition,
+                            position,
+                        )
+                        for item in items
+                        for position, batch in enumerate(item.batches)
+                    ],
+                )
+        except (OrderNotFound, ReviewAlreadyExists):
+            raise
+        except sqlite3.IntegrityError as error:
+            # Backstop: a concurrent insert won the primary-key race.
+            raise ReviewAlreadyExists(review_id) from error
+        except sqlite3.Error as error:
+            raise StorageUnavailable(str(error)) from error
+
+
+def get_shelf_life_review(review_id: str) -> ShelfLifeReviewRecord | None:
+    """Return the persisted review document, or ``None`` if unknown.
+
+    The returned record is rebuilt from the stored header, items and batch
+    rows, so a read always serves the same deterministic document that the
+    creating request returned -- including the booked-quantity snapshot
+    frozen at review time.
+    """
+    review_id = _canonical_review_id(review_id)
+    with _write_lock:
+        try:
+            connection = _get_connection()
+            row = connection.execute(
+                "SELECT order_no, review_date, min_sellable_days "
+                "FROM shelf_life_reviews WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            item_rows = connection.execute(
+                "SELECT gtin, received_qty FROM shelf_life_review_items "
+                "WHERE review_id = ? ORDER BY item_order",
+                (review_id,),
+            ).fetchall()
+            items: list[ShelfLifeReviewItem] = []
+            for item_row in item_rows:
+                batch_rows = connection.execute(
+                    "SELECT batch_no, quantity, expiry_date, remaining_days, "
+                    "disposition FROM shelf_life_batches "
+                    "WHERE review_id = ? AND gtin = ? ORDER BY batch_order",
+                    (review_id, item_row["gtin"]),
+                ).fetchall()
+                items.append(
+                    ShelfLifeReviewItem(
+                        gtin=item_row["gtin"],
+                        received_qty=item_row["received_qty"],
+                        batches=[
+                            ReviewedBatch(
+                                batch_no=batch_row["batch_no"],
+                                quantity=batch_row["quantity"],
+                                expiry_date=date.fromisoformat(
+                                    batch_row["expiry_date"]
+                                ),
+                                remaining_days=batch_row["remaining_days"],
+                                disposition=batch_row["disposition"],
+                            )
+                            for batch_row in batch_rows
+                        ],
+                    )
+                )
+        except sqlite3.Error as error:
+            raise StorageUnavailable(str(error)) from error
+    return ShelfLifeReviewRecord(
+        review_id=review_id,
+        order_no=_canonical_order_no(row["order_no"]),
+        review_date=date.fromisoformat(row["review_date"]),
+        min_sellable_days=row["min_sellable_days"],
+        items=items,
     )

@@ -104,6 +104,41 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
    时间未严格递增、跨度超过七天或温度数值超出 ±10¹⁰⁰：**422**（Pydantic
    结构化 `detail`）。任何失败请求都**不留记录**——评估号可原样重新提交。
 
+## 货架期复核规则
+
+药品入库后需按生产批号与有效期安排上架。库管员为**已存在的收货单**提交一次
+货架期复核：唯一复核号、复核日期、最短可售天数，以及各 GTIN 的批号、数量与
+失效日期，服务返回货架期处置清单：
+
+1. `POST /shelf-life-reviews` 创建复核。请求体：
+   - `review_id`：唯一复核号（1～128 字符，忽略首尾空白比较，空白变体按重复
+     处理；不得含 `/`，否则无法作为单个 URL 路径段寻址）；
+   - `order_no`：已存在的收货单号（按收货单同一规范化规则寻址，含升级前落库
+     的空白旧单）；
+   - `review_date`：复核日期（ISO-8601 日历日 `YYYY-MM-DD`）；
+   - `min_sellable_days`：最短可售天数门槛，**0～3650** 的整数；
+   - `items`：1～100 个 GTIN 条目（不得重复），每条携带 1～100 个批次：
+     `batch_no`（1～128 字符且至少含一个非空白字符，同一 GTIN 内不得重复）、
+     `quantity`（正整数，上限为 SQLite 有符号 64 位整数最大值）、
+     `expiry_date`（日历日）。
+2. 服务按**自然日**计算剩余天数 `remaining_days = expiry_date − review_date`，
+   并依次标记处置结论：小于零 → `expired`；达到零但低于门槛 → `short_dated`；
+   达到或超过门槛 → `usable`（复核当天到期的批次剩余 0 天，不算 expired；门槛
+   为 0 时未过期批次一律 usable）。每个 GTIN 内批次按**失效日期、批号**稳定
+   排序返回，GTIN 条目本身保持提交顺序。
+3. 参与复核的 GTIN 必须已在该收货单**入账**——计划内或计划外已入账商品均可
+   （计划外行 `planned_qty` 为 `null` 同样参与）；从未入账的 GTIN 返回 **404**。
+   同一 GTIN 的批次数量合计不得超过该 GTIN 的**已实收量**，超出按 **422** 拒绝
+   （已建单但实收为 0 的 GTIN 因此也只能得到 422，而不是 404）。
+4. 复核、GTIN 条目与批次明细在**同一事务**写入 `shelf_life_reviews`、
+   `shelf_life_review_items` 与 `shelf_life_batches` 三表（随启动迁移幂等创建，
+   外键关联现有收货单）。实收量按复核时刻**快照**保存，之后继续扫描收货不改变
+   已生成的清单；`GET /shelf-life-reviews/{review_id}` 返回与创建时**同一份**
+   确定性文档。
+5. 复核号重复：**409**；收货单或已入账 GTIN 不存在：**404**；日期格式非法、
+   批号重复、数量非正、门槛超出 0～3650 或申报总量超出实收量：**422**（Pydantic
+   结构化 `detail`）。任何失败请求都**不留记录**——复核号可原样重新提交。
+
 ## 可复算示例
 
 有效代码 `07300040109316`（校验位应为 6）：
@@ -333,6 +368,91 @@ Python 3.12 + FastAPI 纯后端服务。收货扫描批量提交包装码，服�
 返回与创建时同一份确定性文档（原始采样 + 持久化摘要）；评估号不存在
 返回 `404`。
 
+### `POST /shelf-life-reviews`
+
+为已入账的收货单提交货架期复核并取得处置清单。请求（`PO-2026-0001` 中
+`07300040109316` 已实收 8，`00000000000017` 为计划外已入账 2）：
+
+```json
+{
+  "review_id": "SLR-2026-0001",
+  "order_no": "PO-2026-0001",
+  "review_date": "2026-09-12",
+  "min_sellable_days": 30,
+  "items": [
+    {
+      "gtin": "07300040109316",
+      "batches": [
+        {"batch_no": "B-USABLE", "quantity": 3, "expiry_date": "2027-01-01"},
+        {"batch_no": "B-EXPIRED", "quantity": 2, "expiry_date": "2026-09-01"},
+        {"batch_no": "B-SHORT", "quantity": 2, "expiry_date": "2026-10-01"},
+        {"batch_no": "B-EDGE", "quantity": 1, "expiry_date": "2026-10-12"}
+      ]
+    },
+    {
+      "gtin": "00000000000017",
+      "batches": [
+        {"batch_no": "C-1", "quantity": 2, "expiry_date": "2026-09-12"}
+      ]
+    }
+  ]
+}
+```
+
+成功 `201`（批次按失效日期、批号排序；`received_qty` 为复核时刻实收快照）：
+
+```json
+{
+  "review_id": "SLR-2026-0001",
+  "order_no": "PO-2026-0001",
+  "review_date": "2026-09-12",
+  "min_sellable_days": 30,
+  "items": [
+    {
+      "gtin": "07300040109316",
+      "received_qty": 8,
+      "declared_qty": 8,
+      "batches": [
+        {"batch_no": "B-EXPIRED", "quantity": 2, "expiry_date": "2026-09-01",
+         "remaining_days": -11, "disposition": "expired"},
+        {"batch_no": "B-SHORT", "quantity": 2, "expiry_date": "2026-10-01",
+         "remaining_days": 19, "disposition": "short_dated"},
+        {"batch_no": "B-EDGE", "quantity": 1, "expiry_date": "2026-10-12",
+         "remaining_days": 30, "disposition": "usable"},
+        {"batch_no": "B-USABLE", "quantity": 3, "expiry_date": "2027-01-01",
+         "remaining_days": 111, "disposition": "usable"}
+      ]
+    },
+    {
+      "gtin": "00000000000017",
+      "received_qty": 2,
+      "declared_qty": 2,
+      "batches": [
+        {"batch_no": "C-1", "quantity": 2, "expiry_date": "2026-09-12",
+         "remaining_days": 0, "disposition": "short_dated"}
+      ]
+    }
+  ],
+  "summary": {
+    "gtin_count": 2,
+    "batch_count": 5,
+    "declared_qty": 10,
+    "expired_batches": 1,
+    "short_dated_batches": 2,
+    "usable_batches": 2
+  }
+}
+```
+
+复核号重复返回 `409`；收货单或已入账 GTIN 不存在返回 `404`；日期格式非法、
+批号重复、数量非正、门槛超出 0～3650 或申报总量超出实收量整体返回 `422`
+且不留任何记录。
+
+### `GET /shelf-life-reviews/{review_id}`
+
+返回与创建时同一份确定性文档（含实收快照与处置结论）；复核号不存在
+返回 `404`。
+
 服务启动后还提供交互式文档：`/docs`（Swagger UI）与 `/openapi.json`。
 
 ## 本地运行（Python 3.12）
@@ -375,6 +495,12 @@ pytest
   未严格递增/跨度超七天（恰好七天允许）/裸时区时间/非有限数值整体 422；超出
   ±10¹⁰⁰ 的温度采样或温区边界明确 422（±10¹⁰⁰ 本身仍可计算），不报错 500、
   不占用评估号；失败请求不留残记录（评估号可复用，库中无孤儿采样行）。
+- `tests/test_shelf_life.py`：自然日剩余天数与三类处置（expired/short_dated/
+  usable，含当天到期、恰好达到门槛与零门槛边界）；GTIN 内按失效日期与批号稳定
+  排序、GTIN 条目保持提交顺序；计划外已入账商品可复核；实收量快照在后续扫描后
+  保持不变、读取与创建一致；复核号重复 409（含空白变体）、未知收货单或未入账
+  GTIN 404（已建单但实收为 0 走 422）；日期非法/批号重复/数量非正/门槛越界/
+  申报总量超实收整体 422；失败请求不留残记录（复核号可复用，库中无孤儿行）。
 
 ## Docker Compose
 
@@ -394,9 +520,11 @@ curl -s localhost:${API_PORT:-8000}/health
 unplanned、确认无效码不计数，并通过存储故障注入验证整批 503 回滚与确定性重试；
 再验证幂等批次键：相同键重放响应一致且不重复计数、冲突重用 409 且计数不变、
 非法键 422、回滚后同键可重试、无键扫描持续累计；
-最后登记冷链评估：全程合规结论、多个越界区段梯形积分的独立复算核对、读取与创建
-一致的确定性文档、重复评估号 409、未知收货单 404、各类非法请求 422 且不留残记录，
-然后以 0/1 退出：
+再登记冷链评估：全程合规结论、多个越界区段梯形积分的独立复算核对、读取与创建
+一致的确定性文档、重复评估号 409、未知收货单 404、各类非法请求 422 且不留残记录；
+最后从建单与扫描开始提交货架期复核：三类处置与自然日剩余天数的独立复算核对、
+GTIN 内失效日期与批号排序、计划外已入账商品参与复核、超量提交 422 且不留残记录、
+创建结果一致读取，然后以 0/1 退出：
 
 ```bash
 docker compose run --rm verify
@@ -411,8 +539,9 @@ app/
   __init__.py
   gtin14.py       # 14 位 ASCII 数字判定与 GTIN-14 校验位公式（无占位实现）
   cold_chain.py   # 冷链评估领域：越界区段归并、相邻点梯形积分、两位小数摘要
-  storage.py      # SQLite 收货单/明细、冷链评估/采样与幂等批次建表、事务内按序递增、整批回滚
-  main.py         # FastAPI 应用：Pydantic 固定请求边界、对账与冷链评估模型及响应
+  shelf_life.py   # 货架期复核领域：自然日剩余天数、三类处置标记、批内稳定排序
+  storage.py      # SQLite 收货单/明细、冷链评估/采样、幂等批次与货架期复核建表、事务内按序递增、整批回滚
+  main.py         # FastAPI 应用：Pydantic 固定请求边界、对账、冷链评估与货架期复核模型及响应
 scripts/
   acceptance.py   # 一次性验收：纯标准库访问真实服务并独立复算
 tests/
@@ -421,6 +550,7 @@ tests/
   test_receipts.py  # 建单/对账/计划外/无效码不计数/事务回滚与确定性重试
   test_idempotency.py  # Idempotency-Key：重放不重复计数、冲突 409、回滚不占键
   test_cold_chain.py  # 冷链评估：合规结论、多区段积分、读取一致、错误信封与无残记录
+  test_shelf_life.py  # 货架期复核：三类处置、批内排序、计划外参与、超量 422 与无残记录
 Dockerfile
 docker-compose.yml
 requirements.txt

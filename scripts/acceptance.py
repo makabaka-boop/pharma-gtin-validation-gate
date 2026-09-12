@@ -29,6 +29,12 @@ It audits both feature areas:
    duplicate assessment number 409, unknown receipt 404, invalid zone /
    too few samples / non-increasing time / span over seven days 422, and
    no residual records after any failed request.
+5. Shelf-life review -- create an order, scan planned and unplanned goods,
+   then submit a review and verify the three dispositions
+   (``expired`` / ``short_dated`` / ``usable``) and the per-GTIN sort
+   against an independent recomputation, confirm unplanned merchandise can
+   be reviewed, prove an over-declared submission leaves no residual
+   record, and read the created document back identically.
 
 Usage (from the repository root):
 
@@ -42,17 +48,19 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 API_BASE = os.environ.get("API_BASE", "http://api:8000")
 VERIFY_URL = f"{API_BASE}/codes/verify"
 RECEIPTS_URL = f"{API_BASE}/receipts"
 COLD_CHAIN_URL = f"{API_BASE}/cold-chain-assessments"
+SHELF_LIFE_URL = f"{API_BASE}/shelf-life-reviews"
 HEALTH_URL = f"{API_BASE}/health"
 
 GTIN_A = "07300040109316"   # valid, check digit 6
 GTIN_B = "00000000000000"   # valid, check digit 0
 GTIN_C = "00000000000017"   # valid, check digit 7 (unplanned in audits)
+GTIN_D = "12345678901231"   # valid, check digit 1 (never booked in audits)
 GTIN_BAD_CHECKSUM = "07300040109310"  # 14 digits, check digit should be 6
 GTIN_MALFORMED = "0730004010-9316"    # hyphen: format error, never converted
 
@@ -847,6 +855,218 @@ def audit_cold_chain_assessments() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Shelf-life review audits
+# ---------------------------------------------------------------------------
+
+
+def _expected_disposition(remaining: int, threshold: int) -> str:
+    """Independent re-implementation used to audit the service output."""
+    if remaining < 0:
+        return "expired"
+    if remaining < threshold:
+        return "short_dated"
+    return "usable"
+
+
+def audit_shelf_life_reviews() -> None:
+    print()
+    print("== shelf-life review: three dispositions, stable sort, read-back ==")
+    suffix = int(time.time())
+    order_no = f"ACC-SL-{suffix}"
+    status_code, _ = _create_order(order_no, [[GTIN_A, 10], [GTIN_B, 3]])
+    check(status_code == 201,
+          f"review receipt created: HTTP 201 (got {status_code})")
+
+    # Book goods: A fills its plan of 10, B receives 2 of its 3 planned,
+    # and C arrives unplanned (booked without a purchase-plan line).
+    status_code, _ = _scan(
+        order_no, [GTIN_A] * 10 + [GTIN_B, GTIN_B, GTIN_C, GTIN_C]
+    )
+    check(status_code == 200, f"booking scans: HTTP 200 (got {status_code})")
+
+    review_date = date(2026, 9, 12)
+    threshold = 30
+    review_id = f"ACC-SLR-{suffix}"
+
+    def batch(batch_no: str, quantity: int, expiry: date) -> dict:
+        return {
+            "batch_no": batch_no,
+            "quantity": quantity,
+            "expiry_date": expiry.isoformat(),
+        }
+
+    items = [
+        {"gtin": GTIN_A, "batches": [
+            batch("B-USABLE", 3, date(2027, 1, 1)),    # 111 days: usable
+            batch("B-EXPIRED", 2, date(2026, 9, 1)),   # -11 days: expired
+            batch("B-SHORT", 2, date(2026, 10, 1)),    # 19 days: short_dated
+            batch("B-EDGE", 1, date(2026, 10, 12)),    # 30 == threshold: usable
+        ]},
+        {"gtin": GTIN_C, "batches": [  # unplanned but booked: reviewable
+            batch("C-1", 2, date(2026, 9, 12)),        # 0 days: short_dated
+        ]},
+    ]
+    review_body = {
+        "review_id": review_id,
+        "order_no": order_no,
+        "review_date": review_date.isoformat(),
+        "min_sellable_days": threshold,
+        "items": items,
+    }
+    status_code, created = request_json(SHELF_LIFE_URL, review_body)
+    check(status_code == 201,
+          f"shelf-life review: HTTP 201 (got {status_code})")
+    if status_code == 201:
+        check(
+            created["review_id"] == review_id
+            and created["order_no"] == order_no
+            and created["review_date"] == "2026-09-12"
+            and created["min_sellable_days"] == threshold,
+            "review echoes id, order, review date and threshold",
+        )
+        # Independent recomputation: remaining calendar days, disposition
+        # and the (expiry date, batch number) sort inside every GTIN.
+        for item, submitted in zip(created["items"], items):
+            expected_batches = sorted(
+                submitted["batches"],
+                key=lambda b: (b["expiry_date"], b["batch_no"]),
+            )
+            check(
+                [b["batch_no"] for b in item["batches"]]
+                == [b["batch_no"] for b in expected_batches],
+                f"{item['gtin']}: batches sorted by expiry date, then batch no",
+            )
+            for got, want in zip(item["batches"], expected_batches):
+                remaining = (
+                    date.fromisoformat(want["expiry_date"]) - review_date
+                ).days
+                check(
+                    got["expiry_date"] == want["expiry_date"]
+                    and got["quantity"] == want["quantity"]
+                    and got["remaining_days"] == remaining
+                    and got["disposition"]
+                    == _expected_disposition(remaining, threshold),
+                    f"{item['gtin']}/{got['batch_no']}: {remaining} day(s) -> "
+                    f"{got['disposition']} matches recomputation",
+                )
+        check(
+            created["items"][0]["received_qty"] == 10
+            and created["items"][0]["declared_qty"] == 8,
+            "planned GTIN snapshot: received 10, declared 8",
+        )
+        check(
+            created["items"][1]["received_qty"] == 2
+            and created["items"][1]["declared_qty"] == 2,
+            "unplanned merchandise reviewed with its booked quantity 2",
+        )
+        check(
+            created["summary"] == {
+                "gtin_count": 2,
+                "batch_count": 5,
+                "declared_qty": 10,
+                "expired_batches": 1,
+                "short_dated_batches": 2,
+                "usable_batches": 2,
+            },
+            "summary counts the three dispositions over all batches",
+        )
+        status_code, fetched = get_json(f"{SHELF_LIFE_URL}/{review_id}")
+        check(
+            status_code == 200 and fetched == created,
+            "GET returns the identical review document",
+        )
+
+    print()
+    print("== shelf-life review: 409 / 404 / 422 contract, no residual records ==")
+    status_code, body = request_json(SHELF_LIFE_URL, review_body)
+    check(status_code == 409,
+          f"duplicate review number: HTTP 409 (got {status_code})")
+    check(isinstance(body, dict) and "detail" in body,
+          "409 body carries the error envelope")
+
+    status_code, _ = request_json(
+        SHELF_LIFE_URL,
+        {**review_body, "review_id": f"ACC-SLR404-{suffix}",
+         "order_no": "NO-SUCH-ORDER"},
+    )
+    check(status_code == 404,
+          f"unknown receipt: HTTP 404 (got {status_code})")
+
+    status_code, _ = request_json(
+        SHELF_LIFE_URL,
+        {**review_body, "review_id": f"ACC-SLR404G-{suffix}",
+         "items": [{"gtin": GTIN_D,
+                    "batches": [batch("D-1", 1, date(2027, 1, 1))]}]},
+    )
+    check(status_code == 404,
+          f"GTIN never booked on the receipt: HTTP 404 (got {status_code})")
+
+    status_code, _ = get_json(f"{SHELF_LIFE_URL}/NO-SUCH-REVIEW")
+    check(status_code == 404, "read unknown review: HTTP 404")
+
+    rejected = {
+        "invalid review date": {"review_date": "12/09/2026"},
+        "invalid expiry date": {"items": [{"gtin": GTIN_A, "batches": [
+            {"batch_no": "B1", "quantity": 1, "expiry_date": "2026-13-01"}]}]},
+        "duplicate batch number": {"items": [{"gtin": GTIN_A, "batches": [
+            batch("B1", 1, date(2027, 1, 1)),
+            batch("B1", 1, date(2027, 2, 1))]}]},
+        "zero quantity": {"items": [{"gtin": GTIN_A, "batches": [
+            batch("B1", 0, date(2027, 1, 1))]}]},
+        "negative quantity": {"items": [{"gtin": GTIN_A, "batches": [
+            batch("B1", -2, date(2027, 1, 1))]}]},
+        "threshold below zero": {"min_sellable_days": -1},
+        "threshold above 3650": {"min_sellable_days": 3651},
+        # B was received 2; declaring 3 overshoots the booked quantity.
+        "declared total exceeds received": {"items": [
+            {"gtin": GTIN_B, "batches": [batch("B1", 3, date(2027, 1, 1))]}]},
+    }
+    failed_ids: list[str] = []
+    for position, (label, overrides) in enumerate(rejected.items()):
+        failing_id = f"ACC-SLRBAD-{position}-{suffix}"
+        failed_ids.append(failing_id)
+        status_code, body = request_json(
+            SHELF_LIFE_URL,
+            {**review_body, "review_id": failing_id, **overrides},
+        )
+        check(status_code == 422, f"{label}: HTTP 422 (got {status_code})")
+        check(isinstance(body, dict)
+              and isinstance(body.get("detail"), list) and body["detail"],
+              f"{label}: structured 'detail' list present")
+
+    # Threshold boundaries: 0 and 3650 are both acceptable.
+    for edge in (0, 3650):
+        status_code, _ = request_json(
+            SHELF_LIFE_URL,
+            {**review_body, "review_id": f"ACC-SLRT{edge}-{suffix}",
+             "min_sellable_days": edge,
+             "items": [{"gtin": GTIN_B,
+                        "batches": [batch("B1", 1, date(2027, 1, 1))]}]},
+        )
+        check(status_code == 201,
+              f"threshold {edge}: HTTP 201 (got {status_code})")
+
+    # No failed request left anything behind: every rejected number is
+    # still unknown, and reusing one succeeds as a complete new review.
+    for failing_id in failed_ids:
+        status_code, _ = get_json(f"{SHELF_LIFE_URL}/{failing_id}")
+        check(status_code == 404,
+              f"failed request left no record for {failing_id!r}")
+    status_code, created = request_json(
+        SHELF_LIFE_URL,
+        {**review_body, "review_id": failed_ids[-1],
+         "items": [{"gtin": GTIN_B,
+                    "batches": [batch("B1", 2, date(2027, 1, 1))]}]},
+    )
+    check(status_code == 201,
+          f"reused review number after 422: HTTP 201 (got {status_code})")
+    if status_code == 201:
+        status_code, fetched = get_json(f"{SHELF_LIFE_URL}/{failed_ids[-1]}")
+        check(status_code == 200 and fetched == created,
+              "reused review reads back identically")
+
+
 def main() -> int:
     wait_for_health()
     audit_mixed_batch()
@@ -855,6 +1075,7 @@ def main() -> int:
     audit_rollback_and_deterministic_retry()
     audit_scan_idempotency()
     audit_cold_chain_assessments()
+    audit_shelf_life_reviews()
 
     print()
     if failures:
@@ -869,6 +1090,10 @@ def main() -> int:
     print("scans keep accumulating. Cold-chain assessments merge excursions")
     print("into segments with exact trapezoidal integrals, serve identical")
     print("documents on read, and keep no residue after rejected requests.")
+    print("Shelf-life reviews mark expired/short_dated/usable batches in")
+    print("calendar days, sort each GTIN by expiry date and batch number,")
+    print("admit unplanned booked goods, reject over-declared totals without")
+    print("residue, and serve the created document identically on read.")
     return 0
 
 
