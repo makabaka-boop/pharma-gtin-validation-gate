@@ -560,3 +560,81 @@ def test_failure_rollback_preserves_counts_from_earlier_commits(
     assert failed.status_code == 503
     state = _state(client, "PO-PRIOR")
     assert _received_by_gtin(state) == {GTIN_A: 2}
+
+
+# ---------------------------------------------------------------------------
+# Received-count ceiling (SQLite INTEGER max): storage-failure semantics
+# ---------------------------------------------------------------------------
+
+SQLITE_INT64_MAX = 2**63 - 1
+
+
+def _set_received(order_no: str, gtin: str, qty: int) -> None:
+    """Drive a line's cumulative count directly, as long-running
+    accumulation would (scanning 2**63 - 1 times is not an option)."""
+    connection = storage._get_connection()
+    connection.execute(
+        "UPDATE receipt_items SET received_qty = ? "
+        "WHERE order_no = ? AND gtin = ?",
+        (qty, order_no, gtin),
+    )
+    connection.commit()
+
+
+def test_planned_line_at_integer_ceiling_scan_is_structured_503(
+    client: TestClient,
+) -> None:
+    # The increment cannot be persisted beyond the SQLite INTEGER range;
+    # it must fail like any storage failure (503), not as an unhandled 500.
+    _create(client, "PO-CEIL", [[GTIN_A, SQLITE_INT64_MAX]])
+    _set_received("PO-CEIL", GTIN_A, SQLITE_INT64_MAX)
+
+    response = client.post("/receipts/PO-CEIL/scans", json=[GTIN_A])
+    assert response.status_code == 503
+    body = response.json()
+    assert "results" not in body
+    assert "detail" in body
+    assert response.headers["Retry-After"] == "1"
+    # The saturated count is preserved, not destroyed.
+    assert _received_by_gtin(_state(client, "PO-CEIL")) == {
+        GTIN_A: SQLITE_INT64_MAX
+    }
+
+
+def test_ceiling_failure_rolls_back_the_whole_batch(client: TestClient) -> None:
+    _create(client, "PO-CEILRB", [[GTIN_A, SQLITE_INT64_MAX], [GTIN_B, 5]])
+    _set_received("PO-CEILRB", GTIN_A, SQLITE_INT64_MAX)
+
+    # GTIN_B books fine, then GTIN_A hits the ceiling: the whole batch must
+    # roll back, so GTIN_B's increment is undone as well.
+    failed = client.post("/receipts/PO-CEILRB/scans", json=[GTIN_B, GTIN_A])
+    assert failed.status_code == 503
+    assert _received_by_gtin(_state(client, "PO-CEILRB")) == {
+        GTIN_A: SQLITE_INT64_MAX,
+        GTIN_B: 0,
+    }
+
+    # Retrying only the healthy line books it deterministically.
+    retried = client.post("/receipts/PO-CEILRB/scans", json=[GTIN_B])
+    assert retried.status_code == 200
+    assert retried.json()["results"][0]["reconciliation"] == {
+        "conclusion": "matched", "planned_qty": 5, "received_qty": 1
+    }
+
+
+def test_unplanned_line_at_integer_ceiling_keeps_count_and_503(
+    client: TestClient,
+) -> None:
+    _create(client, "PO-CEILUNPLAN", [[GTIN_A, 5]])
+    # GTIN_B is not on the plan: the first scan registers the unplanned line.
+    client.post("/receipts/PO-CEILUNPLAN/scans", json=[GTIN_B])
+    _set_received("PO-CEILUNPLAN", GTIN_B, SQLITE_INT64_MAX)
+
+    response = client.post("/receipts/PO-CEILUNPLAN/scans", json=[GTIN_B])
+    assert response.status_code == 503
+    assert "results" not in response.json()
+    # The original accumulated count is kept exactly as it was.
+    assert _received_by_gtin(_state(client, "PO-CEILUNPLAN")) == {
+        GTIN_A: 0,
+        GTIN_B: SQLITE_INT64_MAX,
+    }

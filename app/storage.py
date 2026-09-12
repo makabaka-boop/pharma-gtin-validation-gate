@@ -15,7 +15,11 @@ order inside a single SQLite transaction**. Format errors and check-digit
 mismatches are never written. If any storage statement fails mid-batch the
 whole transaction is rolled back and the caller receives
 :class:`StorageUnavailable`, so a retried batch always starts from the same
-counts -- the retry is deterministic.
+counts -- the retry is deterministic. An increment that would push
+``received_qty`` past the signed 64-bit SQLite INTEGER ceiling fails the
+same way rather than surfacing as an unhandled ``OverflowError``: the batch
+rolls back, the saturated count is preserved and the caller receives the
+retryable storage-failure signal.
 
 A process-wide lock serialises write transactions: each batch is an atomic
 "evaluate then increment" step, so concurrent requests can never produce an
@@ -76,6 +80,12 @@ from .cold_chain import AssessmentSummary, ExcursionSegment, SamplePoint
 # Default lives in the process working directory; override for tests or for
 # mounting a volume in a container.
 DEFAULT_DB_PATH = os.environ.get("RECEIPT_DB_PATH", "receipts.db")
+
+# SQLite INTEGER is a signed 64-bit value. A cumulative received count that
+# would grow past this ceiling cannot be persisted; the increment must fail
+# as a storage failure (rolled back, retryable) instead of surfacing as an
+# unhandled OverflowError when the out-of-range value is bound.
+MAX_SQLITE_INTEGER: int = 2**63 - 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
@@ -401,6 +411,10 @@ def _book_valid_gtins(
     against the *stored* receipt key, so legacy padded rows are booked
     correctly. When ``simulate_storage_failure`` is set, a database error is
     raised after the first increment so the whole batch is rolled back.
+
+    Raises :class:`StorageUnavailable` when an increment would push a
+    cumulative count past the SQLite INTEGER ceiling; the caller's
+    transaction rolls back, so the saturated count is preserved.
     """
     results: list[Reconciliation] = []
     booked = 0
@@ -426,6 +440,16 @@ def _book_valid_gtins(
         else:
             planned_qty = row["planned_qty"]
             received = row["received_qty"] + 1
+            if received > MAX_SQLITE_INTEGER:
+                # The cumulative count no longer fits a SQLite INTEGER:
+                # binding it would raise an OverflowError that escapes as
+                # an unhandled 500. Fail as a storage failure instead so
+                # the batch rolls back and the caller answers a
+                # structured, retryable 503 with the count preserved.
+                raise StorageUnavailable(
+                    f"received_qty for GTIN {gtin!r} would exceed the "
+                    "SQLite INTEGER range"
+                )
             cursor.execute(
                 "UPDATE receipt_items SET received_qty = ? "
                 "WHERE order_no = ? AND gtin = ?",
@@ -485,7 +509,10 @@ def record_scan_batch(
                 )
         except OrderNotFound:
             raise
-        except sqlite3.Error as error:
+        except (sqlite3.Error, OverflowError) as error:
+            # OverflowError backstop: binding an integer outside the SQLite
+            # INTEGER range is a driver-level conversion failure, not an
+            # sqlite3.Error; it is a storage failure all the same.
             raise StorageUnavailable(str(error)) from error
     return results
 
@@ -555,7 +582,9 @@ def record_scan_batch_idempotent(
                 return response_json
         except (OrderNotFound, IdempotencyConflict):
             raise
-        except sqlite3.Error as error:
+        except (sqlite3.Error, OverflowError) as error:
+            # OverflowError backstop: binding an out-of-range Python int is
+            # a driver conversion failure, not an sqlite3.Error subclass.
             raise StorageUnavailable(str(error)) from error
 
 

@@ -323,6 +323,38 @@ def test_keyed_failure_preserves_earlier_committed_counts(
     assert replay.content == committed.content
 
 
+def test_keyed_scan_at_integer_ceiling_is_503_and_frees_key(
+    client: TestClient,
+) -> None:
+    # A cumulative count at the SQLite INTEGER ceiling cannot be incremented;
+    # the keyed batch must fail as a retryable 503 (not an unhandled 500),
+    # keep the saturated count and leave the key unoccupied.
+    ceiling = 2**63 - 1
+    _create(client, "PO-CEILKEY", [[GTIN_A, ceiling]])
+    connection = storage._get_connection()
+    connection.execute(
+        "UPDATE receipt_items SET received_qty = ? "
+        "WHERE order_no = 'PO-CEILKEY' AND gtin = ?",
+        (ceiling, GTIN_A),
+    )
+    connection.commit()
+
+    failed = _scan(client, "PO-CEILKEY", [GTIN_A], key="ceil")
+    assert failed.status_code == 503
+    assert "results" not in failed.json()
+    assert "detail" in failed.json()
+    assert _received_by_gtin(_state(client, "PO-CEILKEY")) == {GTIN_A: ceiling}
+
+    # The rolled-back batch did not occupy its key: resubmitting the same
+    # key is a fresh attempt (another 503 while saturated), never a 409,
+    # and a different array under the key is not a conflict either.
+    retried = _scan(client, "PO-CEILKEY", [GTIN_A], key="ceil")
+    assert retried.status_code == 503
+    other = _scan(client, "PO-CEILKEY", [GTIN_A, GTIN_A], key="ceil")
+    assert other.status_code == 503
+    assert _received_by_gtin(_state(client, "PO-CEILKEY")) == {GTIN_A: ceiling}
+
+
 # ---------------------------------------------------------------------------
 # Keyless batches are unaffected
 # ---------------------------------------------------------------------------
